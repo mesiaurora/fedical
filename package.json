@@ -1,17 +1,17 @@
 {
   "name": "fedical",
+  "type": "module",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "tsx watch src/server.ts",
-    "start": "tsx src/server.ts"
+    "dev": "tsx watch apps/api/src/server.ts",
+    "start": "tsx apps/api/src/server.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
     "fastify": "^5.7.2"
   },
