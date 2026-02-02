@@ -41,7 +41,6 @@ export async function authRoutes(app: FastifyInstance) {
   }); 
 
   /** Register application on instance */
-  /** Register application on instance */
 app.post<{ Body: RegisterBody }>("/register", async (request, reply) => {
   const url = validateInstanceUrl(request.body.instanceUrl);
   if (!url.ok) {
@@ -106,7 +105,6 @@ app.post<{ Body: RegisterBody }>("/register", async (request, reply) => {
     return reply.status(502).send({ ok: false, error: "Instance returned non-JSON response" });
   }
 
-  // Minimal field validation
   const obj = data as Record<string, unknown>;
   const clientId = typeof obj.client_id === "string" ? obj.client_id : "";
   const clientSecret = typeof obj.client_secret === "string" ? obj.client_secret : "";
@@ -124,6 +122,33 @@ app.post<{ Body: RegisterBody }>("/register", async (request, reply) => {
     scopes,
   });
 });
+
+app.get<{ Querystring: { instance: string; clientId: string; scope?: string } }>(
+  "/authorize",
+  async (request, reply) => {
+    const { instance, clientId } = request.query;
+    const scope = request.query.scope ?? scopes;
+
+    if (!instance || !clientId) {
+      return reply.status(400).send({ ok: false, error: "instanceUrl and clientId are required" });
+    }
+
+    const url = validateInstanceUrl(instance);
+    if (!url.ok) {
+      return reply.status(400).send({ ok: false, error: url.error });
+    }
+    const state = crypto.randomUUID();
+
+    const authorizeUrl = new URL("/oauth/authorize", url.origin);
+    authorizeUrl.searchParams.set("client_id", clientId);
+    authorizeUrl.searchParams.set("response_type", "code");
+    authorizeUrl.searchParams.set("redirect_uri", redirectUri);
+    authorizeUrl.searchParams.set("scope", scope);
+    authorizeUrl.searchParams.set("state", state);
+
+    return reply.status(200).send({ ok: true, authorizeUrl: authorizeUrl.toString(), state });
+  }
+);
 
 
 
