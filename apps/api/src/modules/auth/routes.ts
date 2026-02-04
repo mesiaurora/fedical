@@ -11,12 +11,21 @@ type RegisterBody = {
 const scopes = "read write";
 const clientName = "Fedical (local)";
 const redirectUri = "http://127.0.0.1:3000/auth/callback";
-const pendingStates = new Map<string, { origin: string; clientId: string; createdAt: number }>();
+type PendingState = { origin: string; clientId: string; createdAt: number };
+type AuthStores = {
+  pendingStates: Map<string, PendingState>;
+  clientSecrets: Map<string, string>;
+};
+type AuthDeps = AuthStores & { fetchFn?: typeof fetch };
+
+const pendingStates = new Map<string, PendingState>();
 const clientSecrets = new Map<string, string>();
 
 
 
-export async function authRoutes(app: FastifyInstance) {
+export async function authRoutes(app: FastifyInstance, deps: AuthDeps = { pendingStates, clientSecrets }) {
+  const stores = deps;
+  const fetchFn = deps.fetchFn ?? fetch;
   app.get("/", async () => {
     return {
       ok: true,
@@ -117,7 +126,7 @@ export async function authRoutes(app: FastifyInstance) {
       return reply.status(502).send({ ok: false, error: "Instance returned unexpected response" });
     }
 
-    clientSecrets.set(`${origin}::${clientId}`, clientSecret);
+    stores.clientSecrets.set(`${origin}::${clientId}`, clientSecret);
 
     return reply.status(200).send({
       ok: true,
@@ -142,12 +151,12 @@ export async function authRoutes(app: FastifyInstance) {
       return reply.status(400).send({ ok: false, error: url.error });
     }
 
-    if (!clientSecrets.has(`${url.origin}::${clientId}`)) {
+    if (!stores.clientSecrets.has(`${url.origin}::${clientId}`)) {
       return reply.status(400).send({ ok: false, error: "Unknown clientId for this instance" });
     }
 
     const state = crypto.randomUUID();
-    pendingStates.set(state, { origin: url.origin, clientId, createdAt: Date.now() });
+    stores.pendingStates.set(state, { origin: url.origin, clientId, createdAt: Date.now() });
 
     const authorizeUrl = new URL("/oauth/authorize", url.origin);
     authorizeUrl.searchParams.set("client_id", clientId);
@@ -167,7 +176,7 @@ export async function authRoutes(app: FastifyInstance) {
       return reply.status(400).send({ ok: false, error: "code and state are required" });
     }
 
-    const entry = pendingStates.get(state);
+    const entry = stores.pendingStates.get(state);
     if (!entry) {
       return reply.status(400).send({ ok: false, error: "Invalid or expired state" });
     }
@@ -175,18 +184,18 @@ export async function authRoutes(app: FastifyInstance) {
     const ageMs = Date.now() - entry.createdAt;
     const maxAgeMs = 10 * 60 * 1000;
     if (ageMs > maxAgeMs) {
-      pendingStates.delete(state);
+      stores.pendingStates.delete(state);
       return reply.status(400).send({ ok: false, error: "expired state" });
     }
 
-    pendingStates.delete(state);
+    stores.pendingStates.delete(state);
 
-    const clientSecret = clientSecrets.get(`${entry.origin}::${entry.clientId}`);
+    const clientSecret = stores.clientSecrets.get(`${entry.origin}::${entry.clientId}`);
     if (!clientSecret) {
       return reply.status(400).send({ ok: false, error: "Missing client secret for this clientId" });
     }
 
-    const token = await getToken(entry.origin, entry.clientId, clientSecret, code);
+    const token = await getToken(entry.origin, entry.clientId, clientSecret, code, fetchFn);
 
     if (!token.ok) {
       return reply.status(502).send({ ok: false, error: token.error });
