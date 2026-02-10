@@ -51,6 +51,9 @@ const clientRegistrations = new Map<string, ClientRegistration>();
 const identities = new Map<string, AccountIdentity>();
 const tokens = new Map<string, TokenRecord>();
 
+export const getAuthTokenStore = () => tokens;
+export const getAuthIdentityStore = () => identities;
+
 const resolveAuthDataFilePath = () => {
   const explicitFile = process.env.FEDICAL_AUTH_FILE;
   if (explicitFile) {

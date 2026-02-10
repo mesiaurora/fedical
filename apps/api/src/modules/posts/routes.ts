@@ -23,7 +23,7 @@ type PlannedPost = {
   scheduledAt: string;
   text: string;
   visibility: "public" | "unlisted" | "private" | "direct";
-  status: "draft" | "scheduled" | "sending" | "sent" | "canceled";
+  status: "draft" | "scheduled" | "sending" | "sent" | "failed" | "canceled";
   attempts: number;
   lastError?: string;
   sentAt?: string;
@@ -43,6 +43,9 @@ type PostsOptions = Partial<PostsStore> & {
   persist?: boolean;
   enableScheduler?: boolean;
   schedulerIntervalMs?: number;
+  tokenStore?: Map<string, { accessToken: string }>;
+  identityStore?: Map<string, unknown>;
+  fetchFn?: typeof fetch;
 };
 
 const resolveDataFilePath = () => {
@@ -103,6 +106,9 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
   const schedulerIntervalMs = options.schedulerIntervalMs ?? 20000;
   const dataFilePath = options.dataFile ?? resolveDataFilePath();
   const processingIds = new Set<string>();
+  const tokenStore = options.tokenStore;
+  const identityStore = options.identityStore;
+  const fetchFn = options.fetchFn ?? fetch;
 
   if (shouldPersist) {
     await loadPostsFromDisk(dataFilePath, store, (message) => app.log.warn(message));
@@ -130,6 +136,7 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
         post.status = "sending";
         post.updatedAt = new Date().toISOString();
         store.posts.set(post.id, post);
+        processingIds.delete(post.id);
       }
 
       if (shouldPersist) {
@@ -137,6 +144,59 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
           await savePostsToDisk(dataFilePath, store);
         } catch {
           app.log.warn("Failed to persist posts during scheduler tick");
+        }
+      }
+
+      const sendingPosts = Array.from(store.posts.values()).filter(
+        (post) => post.status === "sending"
+      );
+      if (!tokenStore || sendingPosts.length === 0) {
+        return;
+      }
+
+      for (const post of sendingPosts) {
+        if (processingIds.has(post.id)) {
+          continue;
+        }
+        processingIds.add(post.id);
+        const token = tokenStore.get(post.instance);
+        if (!token) {
+          post.status = "failed";
+          post.lastError = "not_logged_in";
+          post.attempts += 1;
+          post.updatedAt = new Date().toISOString();
+          store.posts.set(post.id, post);
+          processingIds.delete(post.id);
+          continue;
+        }
+
+        const sendResult = await sendStatus(post.instance, token.accessToken, post, fetchFn);
+        if (sendResult.ok) {
+          post.status = "sent";
+          post.sentAt = new Date().toISOString();
+          post.remoteId = sendResult.remoteId;
+          post.lastError = undefined;
+        } else {
+          post.status = "failed";
+          post.lastError = sendResult.error;
+          post.attempts += 1;
+          if (sendResult.error === "token_rejected") {
+            tokenStore.delete(post.instance);
+            if (identityStore) {
+              identityStore.delete(post.instance);
+            }
+          }
+        }
+        post.updatedAt = new Date().toISOString();
+        store.posts.set(post.id, post);
+        processingIds.delete(post.id);
+      }
+
+      if (shouldPersist) {
+        try {
+          await savePostsToDisk(dataFilePath, store);
+        } catch {
+          app.log.warn("Failed to persist posts after sending");
         }
       }
     }, schedulerIntervalMs);
@@ -178,7 +238,7 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
       scheduledAt: scheduledDate.toISOString(),
       text,
       visibility: visibilityValue,
-      status: "draft",
+      status: "scheduled",
       attempts: 0,
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
@@ -244,7 +304,7 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
       }
 
       const allowedVisibility = ["public", "unlisted", "private", "direct"] as const;
-      const allowedStatus = ["draft", "scheduled", "sending", "sent", "canceled"] as const;
+      const allowedStatus = ["draft", "scheduled", "sending", "sent", "failed", "canceled"] as const;
       const hasUpdates =
         "scheduledAt" in updates || "text" in updates || "visibility" in updates || "status" in updates;
 
@@ -288,7 +348,8 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
         if (Number.isNaN(scheduledDate.getTime())) {
           return reply.status(400).send({ ok: false, error: "scheduledAt must be a valid date string" });
         }
-        if (post.status !== "draft" && scheduledDate.getTime() <= Date.now()) {
+        const nextStatus = updates.status ?? post.status;
+        if (nextStatus === "scheduled" && scheduledDate.getTime() <= Date.now()) {
           return reply
             .status(400)
             .send({ ok: false, error: "scheduledAt must be in the future unless status is draft" });
@@ -330,3 +391,53 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
     return reply.status(200).send({ ok: true });
   });
 }
+
+export const sendStatus = async (
+  origin: string,
+  accessToken: string,
+  post: Pick<PlannedPost, "text" | "visibility">,
+  fetchFn: typeof fetch = fetch
+): Promise<{ ok: true; remoteId: string } | { ok: false; error: string }> => {
+  const url = `${origin}/api/v1/statuses`;
+  const body = new URLSearchParams({
+    status: post.text,
+    visibility: post.visibility,
+  });
+
+  let res: Response;
+  try {
+    res = await fetchFn(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        "authorization": `Bearer ${accessToken}`,
+      },
+      body: body.toString(),
+    });
+  } catch {
+    return { ok: false, error: "network_error" };
+  }
+
+  const text = await res.text().catch(() => "");
+  if (res.status === 401 || res.status === 403) {
+    return { ok: false, error: "token_rejected" };
+  }
+  if (!res.ok) {
+    return { ok: false, error: `status_post_failed_${res.status}` };
+  }
+
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return { ok: false, error: "invalid_response" };
+  }
+
+  const obj = data as Record<string, unknown>;
+  const id = typeof obj.id === "string" ? obj.id : "";
+  if (!id) {
+    return { ok: false, error: "invalid_response" };
+  }
+
+  return { ok: true, remoteId: id };
+};

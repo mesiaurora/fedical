@@ -33,7 +33,11 @@ type PlannedPost = {
   scheduledAt: string;
   text: string;
   visibility: "public" | "unlisted" | "private" | "direct";
-  status: "draft" | "scheduled" | "sent" | "canceled";
+  status: "draft" | "scheduled" | "sending" | "sent" | "failed" | "canceled";
+  attempts: number;
+  lastError?: string;
+  sentAt?: string;
+  remoteId?: string;
 };
 
 type AccountIdentity = {
@@ -75,9 +79,11 @@ export default function App() {
   const [editText, setEditText] = useState("");
   const [editVisibility, setEditVisibility] =
     useState<PlannedPost["visibility"]>("public");
+  const [editStatus, setEditStatus] = useState<PlannedPost["status"]>("draft");
   const [editError, setEditError] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [showSent, setShowSent] = useState(true);
   const timezoneLabel = useMemo(() => getTimezoneLabel(), []);
 
   const weekDates = useMemo(
@@ -105,6 +111,10 @@ export default function App() {
   const today = new Date();
   const todayStart = new Date(today);
   todayStart.setHours(0, 0, 0, 0);
+  const safeSelectedDay = (() => {
+    const normalized = normalizeDate(selectedDay);
+    return Number.isNaN(normalized.getTime()) ? weekStartDate : normalized;
+  })();
 
   const fetchPosts = useCallback(
     async (signal?: AbortSignal) => {
@@ -267,6 +277,15 @@ export default function App() {
     return `${hours}:${minutes}`;
   };
 
+  const statusBadgeStyles: Record<PlannedPost["status"], string> = {
+    draft: "bg-slate-100 text-slate-700 border border-slate-200",
+    scheduled: "bg-amber-100 text-amber-800 border border-amber-200",
+    sending: "bg-indigo-100 text-indigo-800 border border-indigo-200",
+    sent: "bg-emerald-100 text-emerald-800 border border-emerald-200",
+    failed: "bg-rose-100 text-rose-800 border border-rose-200",
+    canceled: "bg-slate-200 text-slate-600 border border-slate-300",
+  };
+
   const getDefaultScheduledAt = (day: Date | string) => {
     const now = new Date();
     const rounded = new Date(now);
@@ -321,6 +340,23 @@ export default function App() {
     setEditText(post.text);
     setEditVisibility(post.visibility);
     setEditScheduledAt(getLocalDateTimeValue(post.scheduledAt));
+    setEditStatus(post.status);
+  };
+
+  const openRetryModal = (post: PlannedPost) => {
+    const now = new Date();
+    const minScheduled = new Date(now.getTime() + 2 * 60_000);
+    const existing = new Date(post.scheduledAt);
+    const target =
+      Number.isNaN(existing.getTime()) || existing.getTime() < minScheduled.getTime()
+        ? minScheduled
+        : existing;
+    setActivePost(post);
+    setEditError(null);
+    setEditText(post.text);
+    setEditVisibility(post.visibility);
+    setEditStatus("scheduled");
+    setEditScheduledAt(getLocalDateTimeValue(target.toISOString()));
   };
 
   const closeEditModal = () => {
@@ -396,7 +432,7 @@ export default function App() {
       setEditError("Scheduled time must be a valid date.");
       return;
     }
-    if (parsed.getTime() <= Date.now()) {
+    if (parsed.getTime() <= Date.now() && editStatus === "scheduled") {
       setEditError("Scheduled time must be in the future.");
       return;
     }
@@ -407,6 +443,7 @@ export default function App() {
         scheduledAt: new Date(editScheduledAt).toISOString(),
         text: editText.trim(),
         visibility: editVisibility,
+        status: editStatus,
       };
       const res = await fetch(`/posts/${activePost.id}`, {
         method: "PATCH",
@@ -506,6 +543,12 @@ export default function App() {
     if (isEditing) {
       return "Saving changes...";
     }
+    if (editStatus === "scheduled") {
+      const parsed = new Date(editScheduledAt);
+      if (parsed.getTime() <= Date.now()) {
+        return "Scheduled time must be in the future.";
+      }
+    }
     if (editText.trim().length === 0) {
       return "Text is required.";
     }
@@ -519,7 +562,7 @@ export default function App() {
     if (Number.isNaN(parsed.getTime())) {
       return "Scheduled time must be valid.";
     }
-    if (parsed.getTime() <= Date.now()) {
+    if (parsed.getTime() <= Date.now() && editStatus === "scheduled") {
       return "Scheduled time must be in the future.";
     }
     return "";
@@ -604,6 +647,12 @@ export default function App() {
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <button
+                onClick={() => setShowSent((current) => !current)}
+                className="rounded-full border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+              >
+                {showSent ? "Hide sent" : "Show sent"}
+              </button>
+              <button
                 onClick={openModal}
                 className="rounded-full border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-700 transition hover:border-indigo-300 hover:bg-indigo-100"
               >
@@ -649,7 +698,9 @@ export default function App() {
           <div className="mt-4 grid grid-cols-7 gap-4">
             {weekDates.map((day) => {
               const dayKey = formatDate(day.date);
-              const dayPosts = postsByDay.get(dayKey) ?? [];
+              const dayPosts = (postsByDay.get(dayKey) ?? []).filter(
+                (post) => showSent || post.status !== "sent"
+              );
               const isSelected = isSameDay(day.date, selectedDay);
               const isPastDay = day.date.getTime() < todayStart.getTime();
               return (
@@ -672,24 +723,50 @@ export default function App() {
                     <span>No posts yet</span>
                   ) : (
                     <div className="flex h-full flex-col gap-2 overflow-hidden">
-                    {dayPosts.map((post) => (
-                      <div
-                        key={post.id}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          openEditModal(post);
-                        }}
-                        className="rounded-xl border border-slate-200/70 bg-white/80 px-2 py-1 text-[11px] text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-white"
-                      >
+                      {dayPosts.map((post) => (
+                        <div
+                          key={post.id}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openEditModal(post);
+                          }}
+                          className="rounded-xl border border-slate-200/70 bg-white/80 px-2 py-1 text-[11px] text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-white"
+                        >
                           <div className="flex items-center justify-between gap-2">
                             <span className="font-semibold text-slate-600">
                               {formatTime(post.scheduledAt)}
                             </span>
-                            <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] uppercase tracking-wide text-slate-500">
-                              {post.visibility}
-                            </span>
+                            <div className="flex items-center gap-1">
+                              <span
+                                className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${statusBadgeStyles[post.status]}`}
+                              >
+                                {post.status}
+                              </span>
+                              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] uppercase tracking-wide text-slate-500">
+                                {post.visibility}
+                              </span>
+                            </div>
                           </div>
                           <div className="mt-1 truncate text-slate-600">{post.text}</div>
+                          {post.status === "sending" && (
+                            <div className="mt-1 text-[10px] text-indigo-600">Sending…</div>
+                          )}
+                          {post.status === "failed" && (
+                            <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-rose-600">
+                              <span>
+                                {post.lastError ?? "Failed"} · attempts {post.attempts}
+                              </span>
+                              <button
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  openRetryModal(post);
+                                }}
+                                className="rounded-full border border-rose-200 px-2 py-0.5 text-[10px] font-semibold text-rose-600 hover:border-rose-300 hover:text-rose-700"
+                              >
+                                Retry
+                              </button>
+                            </div>
+                          )}
                         </div>
                       ))}
                     </div>
@@ -708,7 +785,7 @@ export default function App() {
               <div>
                 <h3 className="text-xl font-semibold text-slate-900">Add post</h3>
                 <p className="text-sm text-slate-500">
-                  Scheduled for {formatDate(selectedDay)}
+                  Scheduled for {formatDate(safeSelectedDay)}
                 </p>
               </div>
               <button
@@ -871,6 +948,27 @@ export default function App() {
                   <option value="direct">Direct</option>
                 </select>
               </label>
+              {activePost.status === "sent" ? (
+                <div className="flex items-center justify-between rounded-xl border border-emerald-100 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
+                  <span>Status</span>
+                  <span className="font-semibold">Sent</span>
+                </div>
+              ) : (
+                <label className="flex flex-col gap-2 text-sm text-slate-600">
+                  Status
+                  <select
+                    value={editStatus}
+                    onChange={(event) =>
+                      setEditStatus(event.target.value as PlannedPost["status"])
+                    }
+                    className="rounded-xl border border-slate-200 px-3 py-2 text-sm text-slate-700 outline-none focus:border-indigo-300"
+                  >
+                    <option value="draft">Draft</option>
+                    <option value="scheduled">Scheduled</option>
+                    <option value="canceled">Canceled</option>
+                  </select>
+                </label>
+              )}
 
               {editError && (
                 <div className="rounded-xl border border-rose-100 bg-rose-50 px-3 py-2 text-sm text-rose-700">

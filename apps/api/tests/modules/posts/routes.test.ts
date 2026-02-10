@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import { describe, expect, it } from "vitest";
-import { postsRoutes } from "../../../src/modules/posts/routes.js";
+import { postsRoutes, sendStatus } from "../../../src/modules/posts/routes.js";
 
 describe("POST /posts", () => {
   it("creates a planned post", async () => {
@@ -27,7 +27,7 @@ describe("POST /posts", () => {
       expect(body.post.instance).toBe("https://example.com");
       expect(body.post.text).toBe("Hello from the future");
       expect(body.post.visibility).toBe("public");
-      expect(body.post.status).toBe("draft");
+      expect(body.post.status).toBe("scheduled");
       expect(typeof body.post.id).toBe("string");
       expect(typeof body.post.createdAt).toBe("string");
       expect(typeof body.post.updatedAt).toBe("string");
@@ -276,6 +276,41 @@ describe("PATCH /posts/:id validation", () => {
       expect(body.error).toMatch(/future/i);
     } finally {
       await app.close();
+    }
+  });
+});
+
+describe("sendStatus", () => {
+  it("returns remote id on success", async () => {
+    const fakeFetch: typeof fetch = async () =>
+      new Response(JSON.stringify({ id: "123" }), { status: 200 });
+
+    const result = await sendStatus(
+      "https://example.com",
+      "token",
+      { text: "hello", visibility: "public" },
+      fakeFetch
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.remoteId).toBe("123");
+    }
+  });
+
+  it("returns token_rejected on 401", async () => {
+    const fakeFetch: typeof fetch = async () => new Response("Unauthorized", { status: 401 });
+
+    const result = await sendStatus(
+      "https://example.com",
+      "token",
+      { text: "hello", visibility: "public" },
+      fakeFetch
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("token_rejected");
     }
   });
 });
