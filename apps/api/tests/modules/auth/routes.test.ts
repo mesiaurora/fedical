@@ -5,16 +5,20 @@ import { authRoutes } from "../../../src/modules/auth/routes.js";
 const buildApp = async (fetchFn?: typeof fetch) => {
   const app = Fastify();
   const pendingStates = new Map<string, { origin: string; clientId: string; createdAt: number }>();
-  const clientSecrets = new Map<string, string>();
+  const clientRegistrations = new Map<string, { clientSecret: string; redirectUri: string }>();
   const identities = new Map<
     string,
     { id: string; username: string; acct: string; displayName: string; avatar?: string }
   >();
+  const tokens = new Map<
+    string,
+    { accessToken: string; tokenType?: string; scope?: string; updatedAt: string }
+  >();
 
-  await authRoutes(app, { pendingStates, clientSecrets, fetchFn, identities });
+  await authRoutes(app, { pendingStates, clientRegistrations, fetchFn, identities, tokens });
   await app.ready();
 
-  return { app, pendingStates, clientSecrets, identities };
+  return { app, pendingStates, clientRegistrations, identities, tokens };
 };
 
 const createFetchSequence = (responses: Response[]): typeof fetch => {
@@ -50,10 +54,13 @@ describe("/authorize", () => {
   });
 
   it("accepts known clientId and returns state with authorizeUrl", async () => {
-    const { app, clientSecrets } = await buildApp();
+    const { app, clientRegistrations } = await buildApp();
     const origin = "https://example.com";
     const clientId = "client-123";
-    clientSecrets.set(`${origin}::${clientId}`, "secret-123");
+    clientRegistrations.set(`${origin}::${clientId}`, {
+      clientSecret: "secret-123",
+      redirectUri: "http://127.0.0.1:3000/auth/callback",
+    });
 
     try {
       const res = await app.inject({
@@ -126,9 +133,12 @@ describe("/callback", () => {
       ),
     ]);
 
-    const { app, pendingStates, clientSecrets } = await buildApp(fakeFetch);
+    const { app, pendingStates, clientRegistrations } = await buildApp(fakeFetch);
     pendingStates.set(state, { origin, clientId, createdAt: Date.now() });
-    clientSecrets.set(`${origin}::${clientId}`, "secret-123");
+    clientRegistrations.set(`${origin}::${clientId}`, {
+      clientSecret: "secret-123",
+      redirectUri: "http://127.0.0.1:3000/auth/callback",
+    });
 
     try {
       const res = await app.inject({
@@ -169,9 +179,12 @@ describe("/callback", () => {
       new Response("Unauthorized", { status: 401 }),
     ]);
 
-    const { app, pendingStates, clientSecrets } = await buildApp(fakeFetch);
+    const { app, pendingStates, clientRegistrations } = await buildApp(fakeFetch);
     pendingStates.set(state, { origin, clientId, createdAt: Date.now() });
-    clientSecrets.set(`${origin}::${clientId}`, "secret-123");
+    clientRegistrations.set(`${origin}::${clientId}`, {
+      clientSecret: "secret-123",
+      redirectUri: "http://127.0.0.1:3000/auth/callback",
+    });
 
     try {
       const res = await app.inject({
@@ -211,6 +224,91 @@ describe("/me", () => {
       const body = JSON.parse(res.body) as { ok: boolean; account?: { username: string } };
       expect(body.ok).toBe(true);
       expect(body.account?.username).toBe("kea");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rehydrates identity when token exists", async () => {
+    const fakeFetch: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({
+          id: "99",
+          username: "rehydrate",
+          acct: "rehydrate",
+          display_name: "Rehydrate User",
+        }),
+        { status: 200 }
+      );
+    const { app, tokens, identities } = await buildApp(fakeFetch);
+    tokens.set("https://mastodon.social", {
+      accessToken: "token-1",
+      updatedAt: new Date().toISOString(),
+    });
+
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: "/me?instance=https://mastodon.social",
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body) as { ok: boolean; account?: { username: string } };
+      expect(body.ok).toBe(true);
+      expect(body.account?.username).toBe("rehydrate");
+      expect(identities.has("https://mastodon.social")).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("returns 401 and clears token when token is rejected", async () => {
+    const fakeFetch: typeof fetch = async () => new Response("Unauthorized", { status: 401 });
+    const { app, tokens, identities } = await buildApp(fakeFetch);
+    tokens.set("https://mastodon.social", {
+      accessToken: "token-2",
+      updatedAt: new Date().toISOString(),
+    });
+
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: "/me?instance=https://mastodon.social",
+      });
+
+      expect(res.statusCode).toBe(401);
+      expect(tokens.has("https://mastodon.social")).toBe(false);
+      expect(identities.has("https://mastodon.social")).toBe(false);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe("/logout", () => {
+  it("clears token and identity for instance", async () => {
+    const { app, tokens, identities } = await buildApp();
+    tokens.set("https://mastodon.social", {
+      accessToken: "token-3",
+      updatedAt: new Date().toISOString(),
+    });
+    identities.set("https://mastodon.social", {
+      id: "2",
+      username: "user",
+      acct: "user",
+      displayName: "User",
+    });
+
+    try {
+      const res = await app.inject({
+        method: "POST",
+        url: "/logout",
+        payload: { instance: "https://mastodon.social" },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(tokens.has("https://mastodon.social")).toBe(false);
+      expect(identities.has("https://mastodon.social")).toBe(false);
     } finally {
       await app.close();
     }

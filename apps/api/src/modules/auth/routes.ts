@@ -13,14 +13,24 @@ type RegisterBody = {
 
 const scopes = "read write";
 const clientName = "Fedical (local)";
-const redirectUri = "http://127.0.0.1:3000/auth/callback";
-type PendingState = { origin: string; clientId: string; createdAt: number };
+const getRedirectUri = () =>
+  process.env.FEDICAL_REDIRECT_URI ?? "http://127.0.0.1:3000/auth/callback";
+type PendingState = {
+  origin: string;
+  clientId: string;
+  createdAt: number;
+  redirectUri?: string;
+};
 type AccountIdentity = {
   id: string;
   username: string;
   acct: string;
   displayName: string;
   avatar?: string;
+};
+type ClientRegistration = {
+  clientSecret: string;
+  redirectUri: string;
 };
 type TokenRecord = {
   accessToken: string;
@@ -30,14 +40,14 @@ type TokenRecord = {
 };
 type AuthStores = {
   pendingStates: Map<string, PendingState>;
-  clientSecrets: Map<string, string>;
+  clientRegistrations: Map<string, ClientRegistration>;
   identities?: Map<string, AccountIdentity>;
   tokens?: Map<string, TokenRecord>;
 };
-type AuthDeps = AuthStores & { fetchFn?: typeof fetch };
+type AuthDeps = Partial<AuthStores> & { fetchFn?: typeof fetch; persist?: boolean; dataFile?: string };
 
 const pendingStates = new Map<string, PendingState>();
-const clientSecrets = new Map<string, string>();
+const clientRegistrations = new Map<string, ClientRegistration>();
 const identities = new Map<string, AccountIdentity>();
 const tokens = new Map<string, TokenRecord>();
 
@@ -115,19 +125,24 @@ const saveAuthData = async (
 
 
 
-export async function authRoutes(
-  app: FastifyInstance,
-  deps: AuthDeps = { pendingStates, clientSecrets, identities, tokens }
-) {
-  const stores = deps;
-  const identityStore = deps.identities ?? identities;
-  const tokenStore = deps.tokens ?? tokens;
-  const fetchFn = deps.fetchFn ?? fetch;
+export async function authRoutes(app: FastifyInstance, options: AuthDeps = {}) {
+  const stores: AuthStores = {
+    pendingStates: options.pendingStates ?? pendingStates,
+    clientRegistrations: options.clientRegistrations ?? clientRegistrations,
+    identities: options.identities ?? identities,
+    tokens: options.tokens ?? tokens,
+  };
+  const identityStore = stores.identities ?? identities;
+  const tokenStore = stores.tokens ?? tokens;
+  const fetchFn = options.fetchFn ?? fetch;
 
-  const authDataFilePath = resolveAuthDataFilePath();
-  await loadAuthData(authDataFilePath, identityStore, tokenStore, (message) =>
-    app.log.warn(message)
-  );
+  const shouldPersist = options.persist ?? (options.tokens === undefined && options.identities === undefined);
+  const authDataFilePath = options.dataFile ?? resolveAuthDataFilePath();
+  if (shouldPersist) {
+    await loadAuthData(authDataFilePath, identityStore, tokenStore, (message) =>
+      app.log.warn(message)
+    );
+  }
   app.get("/", async () => {
     return {
       ok: true,
@@ -172,6 +187,7 @@ export async function authRoutes(
     }
 
     const upstreamUrl = `${origin}/api/v1/apps`;
+    const redirectUri = getRedirectUri();
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
@@ -228,7 +244,7 @@ export async function authRoutes(
       return reply.status(502).send({ ok: false, error: "Instance returned unexpected response" });
     }
 
-    stores.clientSecrets.set(`${origin}::${clientId}`, clientSecret);
+    stores.clientRegistrations.set(`${origin}::${clientId}`, { clientSecret, redirectUri });
 
     return reply.status(200).send({
       ok: true,
@@ -240,8 +256,8 @@ export async function authRoutes(
   });
 
 /** Generate authorization URL */
-  app.get<{ Querystring: { instance: string; clientId: string; scope?: string } }>("/authorize", async (request, reply) => {
-    const { instance, clientId } = request.query;
+  app.get<{ Querystring: { instance: string; clientId: string; scope?: string; redirect?: string } }>("/authorize", async (request, reply) => {
+    const { instance, clientId, redirect } = request.query;
     const scope = request.query.scope ?? scopes;
 
     if (!instance || !clientId) {
@@ -253,17 +269,35 @@ export async function authRoutes(
       return reply.status(400).send({ ok: false, error: url.error });
     }
 
-    if (!stores.clientSecrets.has(`${url.origin}::${clientId}`)) {
+    const registration = stores.clientRegistrations.get(`${url.origin}::${clientId}`);
+    if (!registration) {
       return reply.status(400).send({ ok: false, error: "Unknown clientId for this instance" });
     }
 
+    let redirectUri: string | undefined;
+    if (redirect) {
+      try {
+        const redirectUrl = new URL(redirect);
+        if (redirectUrl.protocol === "https:" || redirectUrl.protocol === "http:") {
+          redirectUri = redirectUrl.toString();
+        }
+      } catch {
+        // ignore invalid redirect
+      }
+    }
+
     const state = crypto.randomUUID();
-    stores.pendingStates.set(state, { origin: url.origin, clientId, createdAt: Date.now() });
+    stores.pendingStates.set(state, {
+      origin: url.origin,
+      clientId,
+      createdAt: Date.now(),
+      redirectUri,
+    });
 
     const authorizeUrl = new URL("/oauth/authorize", url.origin);
     authorizeUrl.searchParams.set("client_id", clientId);
     authorizeUrl.searchParams.set("response_type", "code");
-    authorizeUrl.searchParams.set("redirect_uri", redirectUri);
+    authorizeUrl.searchParams.set("redirect_uri", registration.redirectUri);
     authorizeUrl.searchParams.set("scope", scope);
     authorizeUrl.searchParams.set("state", state);
 
@@ -292,12 +326,19 @@ export async function authRoutes(
 
     stores.pendingStates.delete(state);
 
-    const clientSecret = stores.clientSecrets.get(`${entry.origin}::${entry.clientId}`);
-    if (!clientSecret) {
+    const registration = stores.clientRegistrations.get(`${entry.origin}::${entry.clientId}`);
+    if (!registration) {
       return reply.status(400).send({ ok: false, error: "Missing client secret for this clientId" });
     }
 
-    const token = await getToken(entry.origin, entry.clientId, clientSecret, code, fetchFn);
+    const token = await getToken(
+      entry.origin,
+      entry.clientId,
+      registration.clientSecret,
+      registration.redirectUri,
+      code,
+      fetchFn
+    );
 
     if (!token.ok) {
       return reply.status(502).send({ ok: false, error: token.error });
@@ -331,10 +372,40 @@ export async function authRoutes(
       updatedAt: new Date().toISOString(),
     });
 
-    try {
-      await saveAuthData(authDataFilePath, identityStore, tokenStore);
-    } catch {
-      return reply.status(500).send({ ok: false, error: "Failed to persist auth data" });
+    if (shouldPersist) {
+      try {
+        await saveAuthData(authDataFilePath, identityStore, tokenStore);
+      } catch {
+        return reply.status(500).send({ ok: false, error: "Failed to persist auth data" });
+      }
+    }
+
+    if (entry.redirectUri) {
+      const safeRedirect = entry.redirectUri.replace(/"/g, "%22");
+      const payload = JSON.stringify({
+        ok: true,
+        instance: entry.origin,
+        account: accountResult.account,
+      }).replace(/</g, "\\u003c");
+
+      reply.type("text/html");
+      return reply.send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Fedical Login</title>
+  </head>
+  <body>
+    <script>
+      try {
+        if (window.opener) {
+          window.opener.postMessage(${payload}, "${safeRedirect}");
+        }
+      } catch (e) {}
+      window.location.href = "${safeRedirect}";
+    </script>
+  </body>
+</html>`);
     }
 
     return reply.status(200).send({
@@ -358,11 +429,54 @@ export async function authRoutes(
     }
 
     const account = identityStore.get(url.origin);
-    if (!account) {
+    if (account) {
+      return reply.status(200).send({ ok: true, account });
+    }
+
+    const token = tokenStore.get(url.origin);
+    if (!token) {
       return reply.status(401).send({ ok: false, error: "Not logged in" });
     }
 
-    return reply.status(200).send({ ok: true, account });
+    const accountResult = await getVerifiedAccount(url.origin, token.accessToken, fetchFn);
+    if (!accountResult.ok) {
+      if (accountResult.error === "token rejected") {
+        tokenStore.delete(url.origin);
+        identityStore.delete(url.origin);
+        if (shouldPersist) {
+          await saveAuthData(authDataFilePath, identityStore, tokenStore);
+        }
+        return reply.status(401).send({ ok: false, error: "Not logged in" });
+      }
+      return reply.status(502).send({ ok: false, error: accountResult.error });
+    }
+
+    identityStore.set(url.origin, accountResult.account);
+    if (shouldPersist) {
+      await saveAuthData(authDataFilePath, identityStore, tokenStore);
+    }
+
+    return reply.status(200).send({ ok: true, account: accountResult.account });
+  });
+
+  app.post<{ Body: { instance?: string } }>("/logout", async (request, reply) => {
+    const instance = request.body?.instance;
+    if (!instance) {
+      return reply.status(400).send({ ok: false, error: "instance is required" });
+    }
+
+    const url = validateInstanceUrl(instance);
+    if (!url.ok) {
+      return reply.status(400).send({ ok: false, error: url.error });
+    }
+
+    identityStore.delete(url.origin);
+    tokenStore.delete(url.origin);
+    if (shouldPersist) {
+      await saveAuthData(authDataFilePath, identityStore, tokenStore);
+    }
+
+    return reply.status(200).send({ ok: true });
   });
 
 
@@ -388,6 +502,7 @@ export async function authRoutes(
     origin: string,
     clientId: string,
     clientSecret: string,
+    redirectUri: string,
     code: string,
     fetchFn: typeof fetch = fetch
   ): Promise<{ ok: true; tokenText: string } | { ok: false; error: string }> => {

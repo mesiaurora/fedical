@@ -17,6 +17,16 @@ const formatDate = (date: Date) => {
   return `${year}-${month}-${day}`;
 };
 
+const getTimezoneLabel = () => {
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const offsetMinutes = -new Date().getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? "+" : "-";
+  const absMinutes = Math.abs(offsetMinutes);
+  const hours = String(Math.floor(absMinutes / 60)).padStart(2, "0");
+  const minutes = String(absMinutes % 60).padStart(2, "0");
+  return `${timeZone} (UTC${sign}${hours}:${minutes})`;
+};
+
 type PlannedPost = {
   id: string;
   instance: string;
@@ -34,8 +44,16 @@ type AccountIdentity = {
 };
 
 export default function App() {
+  const getInitialInstance = () => {
+    if (typeof window === "undefined") {
+      return "https://mastodon.social";
+    }
+    const stored = window.localStorage.getItem("fedical.instance");
+    return stored || "https://mastodon.social";
+  };
+
   const [weekStartDate, setWeekStartDate] = useState<Date>(() => getWeekStart(new Date()));
-  const [instance, setInstance] = useState("https://mastodon.social");
+  const [instance, setInstance] = useState(getInitialInstance);
   const [posts, setPosts] = useState<PlannedPost[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -43,6 +61,7 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [selectedDay, setSelectedDay] = useState<Date>(() => getWeekStart(new Date()));
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [formScheduledAt, setFormScheduledAt] = useState("");
@@ -59,6 +78,7 @@ export default function App() {
   const [editError, setEditError] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const timezoneLabel = useMemo(() => getTimezoneLabel(), []);
 
   const weekDates = useMemo(
     () =>
@@ -70,12 +90,21 @@ export default function App() {
     [weekStartDate]
   );
 
-  const isSameDay = (a: Date, b: Date) =>
-    a.getFullYear() === b.getFullYear() &&
-    a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate();
+  const normalizeDate = (value: Date | string) => new Date(value);
+
+  const isSameDay = (a: Date | string, b: Date | string) => {
+    const dateA = normalizeDate(a);
+    const dateB = normalizeDate(b);
+    return (
+      dateA.getFullYear() === dateB.getFullYear() &&
+      dateA.getMonth() === dateB.getMonth() &&
+      dateA.getDate() === dateB.getDate()
+    );
+  };
 
   const today = new Date();
+  const todayStart = new Date(today);
+  todayStart.setHours(0, 0, 0, 0);
 
   const fetchPosts = useCallback(
     async (signal?: AbortSignal) => {
@@ -179,7 +208,7 @@ export default function App() {
       const authorizeRes = await fetch(
         `/auth/authorize?instance=${encodeURIComponent(registerData.instance)}&clientId=${encodeURIComponent(
           registerData.clientId
-        )}`
+        )}&redirect=${encodeURIComponent(window.location.origin)}`
       );
       if (!authorizeRes.ok) {
         const data = (await authorizeRes.json().catch(() => null)) as { error?: string } | null;
@@ -187,41 +216,32 @@ export default function App() {
       }
       const authorizeData = (await authorizeRes.json()) as { authorizeUrl: string };
 
-      const popup = window.open(authorizeData.authorizeUrl, "_blank", "noopener,noreferrer");
-      if (!popup) {
-        throw new Error("Popup blocked. Please allow popups and try again.");
-      }
-
-      setAuthLoading(true);
-      const start = Date.now();
-      const poll = async () => {
-        try {
-          const res = await fetch(`/auth/me?instance=${encodeURIComponent(instance)}`);
-          if (res.ok) {
-            const data = (await res.json()) as { account?: AccountIdentity };
-            if (data.account) {
-              setAccount(data.account);
-              setAuthLoading(false);
-              return true;
-            }
-          }
-        } catch {
-          // ignore and keep polling
-        }
-        return false;
-      };
-
-      const interval = window.setInterval(async () => {
-        const done = await poll();
-        if (done || Date.now() - start > 120_000) {
-          window.clearInterval(interval);
-          setAuthLoading(false);
-        }
-      }, 2000);
+      window.location.assign(authorizeData.authorizeUrl);
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : "Failed to connect");
     } finally {
       setIsConnecting(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    setIsLoggingOut(true);
+    setAuthError(null);
+    try {
+      const res = await fetch("/auth/logout", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ instance }),
+      });
+      if (!res.ok) {
+        const data = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(data?.error ?? "Failed to log out");
+      }
+      setAccount(null);
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : "Failed to log out");
+    } finally {
+      setIsLoggingOut(false);
     }
   };
 
@@ -247,7 +267,7 @@ export default function App() {
     return `${hours}:${minutes}`;
   };
 
-  const getDefaultScheduledAt = (day: Date) => {
+  const getDefaultScheduledAt = (day: Date | string) => {
     const now = new Date();
     const rounded = new Date(now);
     rounded.setSeconds(0, 0);
@@ -255,9 +275,22 @@ export default function App() {
     const nextQuarter = Math.ceil((minutes + 1) / 15) * 15;
     rounded.setMinutes(nextQuarter);
 
-    const target = new Date(day);
+    const target = normalizeDate(day);
+    if (Number.isNaN(target.getTime())) {
+      return getLocalDateTimeValue(rounded.toISOString());
+    }
     target.setHours(rounded.getHours(), rounded.getMinutes(), 0, 0);
-    return target.toISOString().slice(0, 16);
+    return getLocalDateTimeValue(target.toISOString());
+  };
+
+  const getRoundedNowValue = () => {
+    const now = new Date();
+    const rounded = new Date(now);
+    rounded.setSeconds(0, 0);
+    const minutes = rounded.getMinutes();
+    const nextQuarter = Math.ceil((minutes + 1) / 15) * 15;
+    rounded.setMinutes(nextQuarter);
+    return getLocalDateTimeValue(rounded.toISOString());
   };
 
   const getLocalDateTimeValue = (iso: string) => {
@@ -271,9 +304,9 @@ export default function App() {
   };
 
   const openModal = (dayOverride?: Date) => {
-    const targetDay = dayOverride ?? selectedDay;
+    const targetDay = dayOverride ? normalizeDate(dayOverride) : normalizeDate(selectedDay);
     if (dayOverride) {
-      setSelectedDay(dayOverride);
+      setSelectedDay(targetDay);
     }
     setFormError(null);
     setFormText("");
@@ -304,6 +337,15 @@ export default function App() {
 
   const handleSubmit = useCallback(async () => {
     if (formText.trim().length === 0 || formText.length > 500) {
+      return;
+    }
+    const scheduledValue = new Date(formScheduledAt);
+    if (Number.isNaN(scheduledValue.getTime())) {
+      setFormError("Scheduled time must be valid.");
+      return;
+    }
+    if (scheduledValue.getTime() <= Date.now()) {
+      setFormError("Scheduled time must be in the future.");
       return;
     }
     setIsSubmitting(true);
@@ -352,6 +394,10 @@ export default function App() {
     const parsed = new Date(editScheduledAt);
     if (Number.isNaN(parsed.getTime())) {
       setEditError("Scheduled time must be a valid date.");
+      return;
+    }
+    if (parsed.getTime() <= Date.now()) {
+      setEditError("Scheduled time must be in the future.");
       return;
     }
     setIsEditing(true);
@@ -432,9 +478,60 @@ export default function App() {
   };
 
   const characterCount = formText.length;
-  const isSubmitDisabled = formText.trim().length === 0 || characterCount > 500 || isSubmitting;
+  const submitDisabledReason = (() => {
+    if (isSubmitting) {
+      return "Saving post...";
+    }
+    if (formText.trim().length === 0) {
+      return "Text is required.";
+    }
+    if (characterCount > 500) {
+      return "Text must be 500 characters or less.";
+    }
+    if (!formScheduledAt) {
+      return "Scheduled time is required.";
+    }
+    const parsed = new Date(formScheduledAt);
+    if (Number.isNaN(parsed.getTime())) {
+      return "Scheduled time must be valid.";
+    }
+    if (parsed.getTime() <= Date.now()) {
+      return "Scheduled time must be in the future.";
+    }
+    return "";
+  })();
+  const isSubmitDisabled = submitDisabledReason !== "";
   const editCharacterCount = editText.length;
-  const isEditDisabled = editText.trim().length === 0 || editCharacterCount > 500 || isEditing;
+  const editDisabledReason = (() => {
+    if (isEditing) {
+      return "Saving changes...";
+    }
+    if (editText.trim().length === 0) {
+      return "Text is required.";
+    }
+    if (editCharacterCount > 500) {
+      return "Text must be 500 characters or less.";
+    }
+    if (!editScheduledAt) {
+      return "Scheduled time is required.";
+    }
+    const parsed = new Date(editScheduledAt);
+    if (Number.isNaN(parsed.getTime())) {
+      return "Scheduled time must be valid.";
+    }
+    if (parsed.getTime() <= Date.now()) {
+      return "Scheduled time must be in the future.";
+    }
+    return "";
+  })();
+  const isEditDisabled = editDisabledReason !== "";
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem("fedical.instance", instance);
+  }, [instance]);
 
   return (
     <div className="min-h-screen px-6 py-10">
@@ -477,6 +574,13 @@ export default function App() {
                     <span className="font-medium text-slate-700">
                       {account.displayName || `@${account.acct}`}
                     </span>
+                    <button
+                      onClick={handleLogout}
+                      disabled={isLoggingOut}
+                      className="rounded-full border border-slate-200 px-2 py-0.5 text-[10px] font-medium text-slate-500 transition hover:border-slate-300 hover:text-slate-700 disabled:cursor-not-allowed disabled:text-slate-300"
+                    >
+                      {isLoggingOut ? "Logging out..." : "Log out"}
+                    </button>
                   </div>
                 ) : (
                   <button
@@ -547,15 +651,22 @@ export default function App() {
               const dayKey = formatDate(day.date);
               const dayPosts = postsByDay.get(dayKey) ?? [];
               const isSelected = isSameDay(day.date, selectedDay);
+              const isPastDay = day.date.getTime() < todayStart.getTime();
               return (
                 <div
                   key={`${day.label}-cell`}
-                  onClick={() => openModal(day.date)}
-                  className={`h-32 cursor-pointer rounded-2xl border border-dashed p-3 text-xs shadow-inner transition ${
+                  onClick={() => {
+                    if (!isPastDay) {
+                      openModal(day.date);
+                    }
+                  }}
+                  className={`h-32 rounded-2xl border border-dashed p-3 text-xs shadow-inner transition ${
                     isSameDay(day.date, today)
                       ? "border-indigo-400 bg-indigo-50/80 text-indigo-600 shadow-[0_0_0_2px_rgba(99,102,241,0.15)]"
                       : "border-slate-200 bg-white/90 text-slate-400 hover:border-slate-300 hover:bg-white"
-                  } ${isSelected ? "ring-2 ring-indigo-200" : ""}`}
+                  } ${isSelected ? "ring-2 ring-indigo-200" : ""} ${
+                    isPastDay ? "cursor-not-allowed opacity-60" : "cursor-pointer"
+                  }`}
                 >
                   {dayPosts.length === 0 ? (
                     <span>No posts yet</span>
@@ -610,7 +721,19 @@ export default function App() {
 
             <div className="mt-5 flex flex-col gap-4">
               <label className="flex flex-col gap-2 text-sm text-slate-600">
-                Scheduled at
+                <div className="flex items-center justify-between text-sm">
+                  <span>Scheduled at</span>
+                  <div className="flex items-center gap-2 text-xs text-slate-400">
+                    <span>{timezoneLabel}</span>
+                    <button
+                      type="button"
+                      onClick={() => setFormScheduledAt(getRoundedNowValue())}
+                      className="rounded-full border border-slate-200 px-2 py-0.5 text-[10px] text-slate-500 hover:border-slate-300 hover:text-slate-700"
+                    >
+                      Today
+                    </button>
+                  </div>
+                </div>
                 <input
                   type="datetime-local"
                   value={formScheduledAt}
@@ -669,6 +792,9 @@ export default function App() {
                   >
                     {isSubmitting ? "Saving..." : "Save post"}
                   </button>
+                  {isSubmitDisabled && (
+                    <span className="text-[11px] text-rose-500">{submitDisabledReason}</span>
+                  )}
                   <span className="text-[11px] text-slate-400">Cmd/Ctrl+Enter to submit</span>
                 </div>
               </div>
@@ -697,7 +823,19 @@ export default function App() {
 
             <div className="mt-5 flex flex-col gap-4">
               <label className="flex flex-col gap-2 text-sm text-slate-600">
-                Scheduled at
+                <div className="flex items-center justify-between text-sm">
+                  <span>Scheduled at</span>
+                  <div className="flex items-center gap-2 text-xs text-slate-400">
+                    <span>{timezoneLabel}</span>
+                    <button
+                      type="button"
+                      onClick={() => setEditScheduledAt(getRoundedNowValue())}
+                      className="rounded-full border border-slate-200 px-2 py-0.5 text-[10px] text-slate-500 hover:border-slate-300 hover:text-slate-700"
+                    >
+                      Today
+                    </button>
+                  </div>
+                </div>
                 <input
                   type="datetime-local"
                   value={editScheduledAt}
@@ -748,13 +886,18 @@ export default function App() {
                 >
                   {isDeleting ? "Deleting..." : "Delete"}
                 </button>
-                <button
-                  onClick={handleUpdate}
-                  disabled={isEditDisabled}
-                  className="rounded-full bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
-                >
-                  {isEditing ? "Saving..." : "Save changes"}
-                </button>
+                <div className="flex flex-col items-end gap-1 text-right">
+                  <button
+                    onClick={handleUpdate}
+                    disabled={isEditDisabled}
+                    className="rounded-full bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+                  >
+                    {isEditing ? "Saving..." : "Save changes"}
+                  </button>
+                  {isEditDisabled && (
+                    <span className="text-[11px] text-rose-500">{editDisabledReason}</span>
+                  )}
+                </div>
               </div>
             </div>
           </div>

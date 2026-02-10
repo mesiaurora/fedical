@@ -23,7 +23,11 @@ type PlannedPost = {
   scheduledAt: string;
   text: string;
   visibility: "public" | "unlisted" | "private" | "direct";
-  status: "draft" | "scheduled" | "sent" | "canceled";
+  status: "draft" | "scheduled" | "sending" | "sent" | "canceled";
+  attempts: number;
+  lastError?: string;
+  sentAt?: string;
+  remoteId?: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -37,6 +41,8 @@ const posts = new Map<string, PlannedPost>();
 type PostsOptions = Partial<PostsStore> & {
   dataFile?: string;
   persist?: boolean;
+  enableScheduler?: boolean;
+  schedulerIntervalMs?: number;
 };
 
 const resolveDataFilePath = () => {
@@ -93,10 +99,47 @@ const savePostsToDisk = async (filePath: string, store: PostsStore) => {
 export async function postsRoutes(app: FastifyInstance, options: PostsOptions = {}) {
   const store: PostsStore = { posts: options.posts ?? posts };
   const shouldPersist = options.persist ?? options.posts === undefined;
+  const shouldSchedule = options.enableScheduler ?? options.posts === undefined;
+  const schedulerIntervalMs = options.schedulerIntervalMs ?? 20000;
   const dataFilePath = options.dataFile ?? resolveDataFilePath();
+  const processingIds = new Set<string>();
 
   if (shouldPersist) {
     await loadPostsFromDisk(dataFilePath, store, (message) => app.log.warn(message));
+  }
+
+  if (shouldSchedule) {
+    setInterval(async () => {
+      const now = Date.now();
+      const duePosts = Array.from(store.posts.values()).filter((post) => {
+        if (post.status !== "scheduled") {
+          return false;
+        }
+        if (processingIds.has(post.id)) {
+          return false;
+        }
+        return new Date(post.scheduledAt).getTime() <= now;
+      });
+
+      if (duePosts.length === 0) {
+        return;
+      }
+
+      for (const post of duePosts) {
+        processingIds.add(post.id);
+        post.status = "sending";
+        post.updatedAt = new Date().toISOString();
+        store.posts.set(post.id, post);
+      }
+
+      if (shouldPersist) {
+        try {
+          await savePostsToDisk(dataFilePath, store);
+        } catch {
+          app.log.warn("Failed to persist posts during scheduler tick");
+        }
+      }
+    }, schedulerIntervalMs);
   }
   app.post<{ Body: CreatePostBody }>("/posts", async (request, reply) => {
     const { instance, scheduledAt, text, visibility } = request.body;
@@ -113,6 +156,9 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
     const scheduledDate = new Date(scheduledAt);
     if (Number.isNaN(scheduledDate.getTime())) {
       return reply.status(400).send({ ok: false, error: "scheduledAt must be a valid date string" });
+    }
+    if (scheduledDate.getTime() <= Date.now()) {
+      return reply.status(400).send({ ok: false, error: "scheduledAt must be in the future" });
     }
 
     if (text.length > 500) {
@@ -133,6 +179,7 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
       text,
       visibility: visibilityValue,
       status: "draft",
+      attempts: 0,
       createdAt: now.toISOString(),
       updatedAt: now.toISOString(),
     };
@@ -197,7 +244,7 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
       }
 
       const allowedVisibility = ["public", "unlisted", "private", "direct"] as const;
-      const allowedStatus = ["draft", "scheduled", "sent", "canceled"] as const;
+      const allowedStatus = ["draft", "scheduled", "sending", "sent", "canceled"] as const;
       const hasUpdates =
         "scheduledAt" in updates || "text" in updates || "visibility" in updates || "status" in updates;
 

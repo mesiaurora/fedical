@@ -54,6 +54,7 @@ describe("GET /posts", () => {
       text: `post-${id}`,
       visibility: "public" as const,
       status: "draft" as const,
+      attempts: 0,
       createdAt: new Date(base).toISOString(),
       updatedAt: new Date(base).toISOString(),
     });
@@ -99,6 +100,7 @@ describe("PATCH /posts/:id", () => {
       text: "original",
       visibility: "public" as const,
       status: "draft" as const,
+      attempts: 0,
       createdAt: base.toISOString(),
       updatedAt: new Date(now - 60_000).toISOString(),
     };
@@ -143,6 +145,7 @@ describe("DELETE /posts/:id", () => {
       text: "delete me",
       visibility: "public" as const,
       status: "draft" as const,
+      attempts: 0,
       createdAt: new Date(base).toISOString(),
       updatedAt: new Date(base).toISOString(),
     };
@@ -171,6 +174,106 @@ describe("DELETE /posts/:id", () => {
         url: `/posts/${post.id}`,
       });
       expect(secondDelete.statusCode).toBe(404);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe("POST /posts validation", () => {
+  it("rejects past scheduledAt", async () => {
+    const app = Fastify();
+    const posts = new Map();
+    await postsRoutes(app, { posts });
+    await app.ready();
+
+    try {
+      const scheduledAt = new Date(Date.now() - 60_000).toISOString();
+      const res = await app.inject({
+        method: "POST",
+        url: "/posts",
+        payload: {
+          instance: "https://example.com",
+          scheduledAt,
+          text: "Past post",
+        },
+      });
+
+      expect(res.statusCode).toBe(400);
+      const body = JSON.parse(res.body) as { error?: string };
+      expect(body.error).toMatch(/future/i);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe("PATCH /posts/:id validation", () => {
+  it("rejects invalid scheduledAt", async () => {
+    const app = Fastify();
+    const posts = new Map();
+    await postsRoutes(app, { posts });
+    await app.ready();
+
+    const base = new Date();
+    const post = {
+      id: "post-invalid-date",
+      instance: "https://example.com",
+      scheduledAt: new Date(base.getTime() + 60_000).toISOString(),
+      text: "original",
+      visibility: "public" as const,
+      status: "draft" as const,
+      attempts: 0,
+      createdAt: base.toISOString(),
+      updatedAt: base.toISOString(),
+    };
+    posts.set(post.id, post);
+
+    try {
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/posts/${post.id}`,
+        payload: { scheduledAt: "not-a-date" },
+      });
+
+      expect(res.statusCode).toBe(400);
+      const body = JSON.parse(res.body) as { error?: string };
+      expect(body.error).toMatch(/valid date/i);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects past scheduledAt when status is not draft", async () => {
+    const app = Fastify();
+    const posts = new Map();
+    await postsRoutes(app, { posts });
+    await app.ready();
+
+    const base = new Date();
+    const post = {
+      id: "post-past-when-scheduled",
+      instance: "https://example.com",
+      scheduledAt: new Date(base.getTime() + 60_000).toISOString(),
+      text: "original",
+      visibility: "public" as const,
+      status: "scheduled" as const,
+      attempts: 0,
+      createdAt: base.toISOString(),
+      updatedAt: base.toISOString(),
+    };
+    posts.set(post.id, post);
+
+    try {
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/posts/${post.id}`,
+        payload: { scheduledAt: new Date(Date.now() - 60_000).toISOString() },
+      });
+
+      expect(res.statusCode).toBe(400);
+      const body = JSON.parse(res.body) as { error?: string };
+      expect(body.error).toMatch(/future/i);
     } finally {
       await app.close();
     }

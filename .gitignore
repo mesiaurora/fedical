@@ -5,3 +5,5 @@ dist/
 *.log
 .DS_Store
 .vscode/
+apps/api/data/
+apps/api/data/*.json
