@@ -209,12 +209,22 @@ export async function authRoutes(app: FastifyInstance, deps: AuthDeps = { pendin
     }
 
     const tokenObj = tokenData as Record<string, unknown>;
+    const accessToken = typeof tokenObj.access_token === "string" ? tokenObj.access_token : "";
     const tokenType = typeof tokenObj.token_type === "string" ? tokenObj.token_type : undefined;
     const scope = typeof tokenObj.scope === "string" ? tokenObj.scope : undefined;
+    if (!accessToken) {
+      return reply.status(502).send({ ok: false, error: "Instance returned unexpected token response" });
+    }
+
+    const accountResult = await getVerifiedAccount(entry.origin, accessToken, fetchFn);
+    if (!accountResult.ok) {
+      return reply.status(502).send({ ok: false, error: accountResult.error });
+    }
 
     return reply.status(200).send({
       ok: true,
       instance: entry.origin,
+      account: accountResult.account,
       ...(tokenType ? { token_type: tokenType } : {}),
       ...(scope ? { scope } : {}),
     });
@@ -302,6 +312,80 @@ export async function authRoutes(app: FastifyInstance, deps: AuthDeps = { pendin
     }
 
     return { ok: true, tokenText };
+  };
+
+  const getVerifiedAccount = async (
+    origin: string,
+    accessToken: string,
+    fetchFn: typeof fetch = fetch
+  ): Promise<
+    | {
+      ok: true;
+      account: { id: string; username: string; acct: string; displayName: string; avatar?: string };
+    }
+    | { ok: false; error: string }
+  > => {
+    const verifyUrl = `${origin}/api/v1/accounts/verify_credentials`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+
+    let res: Response;
+    try {
+      res = await fetchFn(verifyUrl, {
+        method: "GET",
+        headers: {
+          "accept": "application/json",
+          "authorization": `Bearer ${accessToken}`,
+        },
+        signal: controller.signal,
+      });
+    } catch {
+      clearTimeout(timeout);
+      return { ok: false, error: "Failed to verify account" };
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const bodyText = await res.text().catch(() => "");
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: "token rejected" };
+    }
+
+    if (!res.ok) {
+      const snippet = bodyText.slice(0, 300).trim();
+      return {
+        ok: false,
+        error: `Verify credentials failed (${res.status})${snippet ? `: ${snippet}` : ""}`,
+      };
+    }
+
+    let data: unknown;
+    try {
+      data = JSON.parse(bodyText);
+    } catch {
+      return { ok: false, error: "Instance returned non-JSON verify response" };
+    }
+
+    const obj = data as Record<string, unknown>;
+    const id = typeof obj.id === "string" ? obj.id : "";
+    const username = typeof obj.username === "string" ? obj.username : "";
+    const acct = typeof obj.acct === "string" ? obj.acct : "";
+    const displayName = typeof obj.display_name === "string" ? obj.display_name : "";
+    const avatar = typeof obj.avatar === "string" ? obj.avatar : undefined;
+    if (!id || !username || !acct) {
+      return { ok: false, error: "Instance returned unexpected verify response" };
+    }
+
+    return {
+      ok: true,
+      account: {
+        id,
+        username,
+        acct,
+        displayName,
+        ...(avatar ? { avatar } : {}),
+      },
+    };
   };
 
 } 

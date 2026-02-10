@@ -13,6 +13,18 @@ const buildApp = async (fetchFn?: typeof fetch) => {
   return { app, pendingStates, clientSecrets };
 };
 
+const createFetchSequence = (responses: Response[]): typeof fetch => {
+  let index = 0;
+  return async () => {
+    const response = responses[index];
+    if (!response) {
+      throw new Error("Unexpected fetch call");
+    }
+    index += 1;
+    return response;
+  };
+};
+
 describe("/authorize", () => {
   it("rejects unknown clientId for instance", async () => {
     const { app } = await buildApp();
@@ -89,7 +101,7 @@ describe("/callback", () => {
     const origin = "https://example.com";
     const clientId = "client-123";
     const state = "fresh-state";
-    const fakeFetch: typeof fetch = async () =>
+    const fakeFetch = createFetchSequence([
       new Response(
         JSON.stringify({
           access_token: "secret-token-value",
@@ -97,7 +109,18 @@ describe("/callback", () => {
           scope: "read write",
         }),
         { status: 200 }
-      );
+      ),
+      new Response(
+        JSON.stringify({
+          id: "123",
+          username: "alice",
+          acct: "alice@example.com",
+          display_name: "Alice",
+          avatar: "https://example.com/avatar.png",
+        }),
+        { status: 200 }
+      ),
+    ]);
 
     const { app, pendingStates, clientSecrets } = await buildApp(fakeFetch);
     pendingStates.set(state, { origin, clientId, createdAt: Date.now() });
@@ -113,6 +136,50 @@ describe("/callback", () => {
       const body = JSON.parse(res.body) as Record<string, unknown>;
       expect(body.ok).toBe(true);
       expect(body.access_token).toBeUndefined();
+      expect(body.account).toEqual({
+        id: "123",
+        username: "alice",
+        acct: "alice@example.com",
+        displayName: "Alice",
+        avatar: "https://example.com/avatar.png",
+      });
+      expect(pendingStates.has(state)).toBe(false);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("returns clean error when verify_credentials rejects token", async () => {
+    const origin = "https://example.com";
+    const clientId = "client-123";
+    const state = "fresh-state-401";
+    const fakeFetch = createFetchSequence([
+      new Response(
+        JSON.stringify({
+          access_token: "secret-token-value",
+          token_type: "Bearer",
+          scope: "read write",
+        }),
+        { status: 200 }
+      ),
+      new Response("Unauthorized", { status: 401 }),
+    ]);
+
+    const { app, pendingStates, clientSecrets } = await buildApp(fakeFetch);
+    pendingStates.set(state, { origin, clientId, createdAt: Date.now() });
+    clientSecrets.set(`${origin}::${clientId}`, "secret-123");
+
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: `/callback?code=abc&state=${state}`,
+      });
+
+      expect(res.statusCode).toBe(502);
+      expect(JSON.parse(res.body)).toEqual({
+        ok: false,
+        error: "token rejected",
+      });
       expect(pendingStates.has(state)).toBe(false);
     } finally {
       await app.close();
