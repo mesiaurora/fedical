@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { validateInstanceUrl } from "../shared/validateInstanceUrl.js";
 
 type ConnectBody = {
   instanceUrl: string;
@@ -230,25 +231,6 @@ export async function authRoutes(app: FastifyInstance, deps: AuthDeps = { pendin
     });
   });
 
-
-  /** Validates instance url and checks it's https or http */
-  const validateInstanceUrl = (
-    url: string
-  ): { ok: true; origin: string } | { ok: false; error: string } => {
-    let instanceUrl: URL;
-
-    try {
-      instanceUrl = new URL(url);
-    } catch {
-      return { ok: false, error: "Invalid instanceUrl" };
-    }
-
-    if (instanceUrl.protocol !== "https:" && instanceUrl.protocol !== "http:") {
-      return { ok: false, error: "instanceUrl must use https or http" };
-    }
-
-    return { ok: true, origin: instanceUrl.origin };
-  };
 
   /** Verifies that the instance url is a Mastodon instance by checking /api/v1/instance */
   const verifyInstanceUrl = async (origin: string): Promise<boolean> => {
