@@ -1,0 +1,14 @@
+{
+  "posts": [
+    {
+      "id": "a9ddfc91-8b34-4bf5-b39a-56d8bbe02af5",
+      "instance": "https://example.com",
+      "scheduledAt": "2026-02-10T12:22:24.347Z",
+      "text": "path check",
+      "visibility": "public",
+      "status": "draft",
+      "createdAt": "2026-02-10T12:17:24.484Z",
+      "updatedAt": "2026-02-10T12:17:24.484Z"
+    }
+  ]
+}

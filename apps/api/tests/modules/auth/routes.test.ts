@@ -6,11 +6,15 @@ const buildApp = async (fetchFn?: typeof fetch) => {
   const app = Fastify();
   const pendingStates = new Map<string, { origin: string; clientId: string; createdAt: number }>();
   const clientSecrets = new Map<string, string>();
+  const identities = new Map<
+    string,
+    { id: string; username: string; acct: string; displayName: string; avatar?: string }
+  >();
 
-  await authRoutes(app, { pendingStates, clientSecrets, fetchFn });
+  await authRoutes(app, { pendingStates, clientSecrets, fetchFn, identities });
   await app.ready();
 
-  return { app, pendingStates, clientSecrets };
+  return { app, pendingStates, clientSecrets, identities };
 };
 
 const createFetchSequence = (responses: Response[]): typeof fetch => {
@@ -181,6 +185,32 @@ describe("/callback", () => {
         error: "token rejected",
       });
       expect(pendingStates.has(state)).toBe(false);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+describe("/me", () => {
+  it("normalizes instance origin when looking up identity", async () => {
+    const { app, identities } = await buildApp();
+    identities.set("https://mastodon.social", {
+      id: "1",
+      username: "kea",
+      acct: "kea",
+      displayName: "Kea",
+    });
+
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: "/me?instance=https://mastodon.social/@kea",
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body) as { ok: boolean; account?: { username: string } };
+      expect(body.ok).toBe(true);
+      expect(body.account?.username).toBe("kea");
     } finally {
       await app.close();
     }

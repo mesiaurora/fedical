@@ -1,4 +1,6 @@
 import type { FastifyInstance } from "fastify";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { validateInstanceUrl } from "../shared/validateInstanceUrl.js";
 
 type CreatePostBody = {
@@ -32,8 +34,70 @@ type PostsStore = {
 
 const posts = new Map<string, PlannedPost>();
 
-export async function postsRoutes(app: FastifyInstance, options: Partial<PostsStore> = {}) {
+type PostsOptions = Partial<PostsStore> & {
+  dataFile?: string;
+  persist?: boolean;
+};
+
+const resolveDataFilePath = () => {
+  const explicitFile = process.env.FEDICAL_DATA_FILE;
+  if (explicitFile) {
+    return explicitFile;
+  }
+
+  const explicitDir = process.env.FEDICAL_DATA_DIR;
+  if (explicitDir) {
+    return path.join(explicitDir, "fedical.json");
+  }
+
+  return path.join(process.cwd(), "apps", "api", "data", "fedical.json");
+};
+
+const loadPostsFromDisk = async (
+  filePath: string,
+  store: PostsStore,
+  warn: (message: string) => void
+) => {
+  try {
+    const raw = await readFile(filePath, "utf8");
+    try {
+      const data = JSON.parse(raw) as { posts?: PlannedPost[] };
+      if (!Array.isArray(data.posts)) {
+        return;
+      }
+      for (const post of data.posts) {
+        if (post && typeof post.id === "string") {
+          store.posts.set(post.id, post);
+        }
+      }
+    } catch {
+      warn(`Failed to parse posts data file. Starting with empty store: ${filePath}`);
+    }
+  } catch (err) {
+    if (err instanceof Error && "code" in err && (err as { code?: string }).code === "ENOENT") {
+      return;
+    }
+    throw err;
+  }
+};
+
+const savePostsToDisk = async (filePath: string, store: PostsStore) => {
+  const dir = path.dirname(filePath);
+  await mkdir(dir, { recursive: true });
+  const tmpPath = `${filePath}.tmp`;
+  const payload = JSON.stringify({ posts: Array.from(store.posts.values()) }, null, 2);
+  await writeFile(tmpPath, payload, "utf8");
+  await rename(tmpPath, filePath);
+};
+
+export async function postsRoutes(app: FastifyInstance, options: PostsOptions = {}) {
   const store: PostsStore = { posts: options.posts ?? posts };
+  const shouldPersist = options.persist ?? options.posts === undefined;
+  const dataFilePath = options.dataFile ?? resolveDataFilePath();
+
+  if (shouldPersist) {
+    await loadPostsFromDisk(dataFilePath, store, (message) => app.log.warn(message));
+  }
   app.post<{ Body: CreatePostBody }>("/posts", async (request, reply) => {
     const { instance, scheduledAt, text, visibility } = request.body;
 
@@ -74,6 +138,14 @@ export async function postsRoutes(app: FastifyInstance, options: Partial<PostsSt
     };
 
     store.posts.set(post.id, post);
+
+    if (shouldPersist) {
+      try {
+        await savePostsToDisk(dataFilePath, store);
+      } catch {
+        return reply.status(500).send({ ok: false, error: "Failed to persist posts" });
+      }
+    }
 
     return reply.status(200).send({ ok: true, post });
   });
@@ -180,6 +252,14 @@ export async function postsRoutes(app: FastifyInstance, options: Partial<PostsSt
       post.updatedAt = new Date().toISOString();
       store.posts.set(post.id, post);
 
+      if (shouldPersist) {
+        try {
+          await savePostsToDisk(dataFilePath, store);
+        } catch {
+          return reply.status(500).send({ ok: false, error: "Failed to persist posts" });
+        }
+      }
+
       return reply.status(200).send({ ok: true, post });
     }
   );
@@ -191,6 +271,15 @@ export async function postsRoutes(app: FastifyInstance, options: Partial<PostsSt
     }
 
     store.posts.delete(id);
+
+    if (shouldPersist) {
+      try {
+        await savePostsToDisk(dataFilePath, store);
+      } catch {
+        return reply.status(500).send({ ok: false, error: "Failed to persist posts" });
+      }
+    }
+
     return reply.status(200).send({ ok: true });
   });
 }

@@ -1,4 +1,6 @@
 import type { FastifyInstance } from "fastify";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { validateInstanceUrl } from "../shared/validateInstanceUrl.js";
 
 type ConnectBody = {
@@ -13,20 +15,119 @@ const scopes = "read write";
 const clientName = "Fedical (local)";
 const redirectUri = "http://127.0.0.1:3000/auth/callback";
 type PendingState = { origin: string; clientId: string; createdAt: number };
+type AccountIdentity = {
+  id: string;
+  username: string;
+  acct: string;
+  displayName: string;
+  avatar?: string;
+};
+type TokenRecord = {
+  accessToken: string;
+  tokenType?: string;
+  scope?: string;
+  updatedAt: string;
+};
 type AuthStores = {
   pendingStates: Map<string, PendingState>;
   clientSecrets: Map<string, string>;
+  identities?: Map<string, AccountIdentity>;
+  tokens?: Map<string, TokenRecord>;
 };
 type AuthDeps = AuthStores & { fetchFn?: typeof fetch };
 
 const pendingStates = new Map<string, PendingState>();
 const clientSecrets = new Map<string, string>();
+const identities = new Map<string, AccountIdentity>();
+const tokens = new Map<string, TokenRecord>();
+
+const resolveAuthDataFilePath = () => {
+  const explicitFile = process.env.FEDICAL_AUTH_FILE;
+  if (explicitFile) {
+    return explicitFile;
+  }
+
+  const explicitDir = process.env.FEDICAL_DATA_DIR;
+  if (explicitDir) {
+    return path.join(explicitDir, "fedical.auth.json");
+  }
+
+  return path.join(process.cwd(), "apps", "api", "data", "fedical.auth.json");
+};
+
+const loadAuthData = async (
+  filePath: string,
+  identityStore: Map<string, AccountIdentity>,
+  tokenStore: Map<string, TokenRecord>,
+  warn: (message: string) => void
+) => {
+  try {
+    const raw = await readFile(filePath, "utf8");
+    try {
+      const data = JSON.parse(raw) as {
+        identities?: Record<string, AccountIdentity>;
+        tokens?: Record<string, TokenRecord>;
+      };
+      if (data.identities && typeof data.identities === "object") {
+        for (const [origin, identity] of Object.entries(data.identities)) {
+          if (identity && typeof identity.id === "string") {
+            identityStore.set(origin, identity);
+          }
+        }
+      }
+      if (data.tokens && typeof data.tokens === "object") {
+        for (const [origin, token] of Object.entries(data.tokens)) {
+          if (token && typeof token.accessToken === "string") {
+            tokenStore.set(origin, token);
+          }
+        }
+      }
+    } catch {
+      warn(`Failed to parse auth data file. Starting with empty auth store: ${filePath}`);
+    }
+  } catch (err) {
+    if (err instanceof Error && "code" in err && (err as { code?: string }).code === "ENOENT") {
+      return;
+    }
+    throw err;
+  }
+};
+
+const saveAuthData = async (
+  filePath: string,
+  identityStore: Map<string, AccountIdentity>,
+  tokenStore: Map<string, TokenRecord>
+) => {
+  const dir = path.dirname(filePath);
+  await mkdir(dir, { recursive: true });
+  const tmpPath = `${filePath}.tmp`;
+  const payload = JSON.stringify(
+    {
+      identities: Object.fromEntries(identityStore.entries()),
+      tokens: Object.fromEntries(tokenStore.entries()),
+    },
+    null,
+    2
+  );
+  await writeFile(tmpPath, payload, "utf8");
+  await rename(tmpPath, filePath);
+};
 
 
 
-export async function authRoutes(app: FastifyInstance, deps: AuthDeps = { pendingStates, clientSecrets }) {
+export async function authRoutes(
+  app: FastifyInstance,
+  deps: AuthDeps = { pendingStates, clientSecrets, identities, tokens }
+) {
   const stores = deps;
+  const identityStore = deps.identities ?? identities;
+  const tokenStore = deps.tokens ?? tokens;
   const fetchFn = deps.fetchFn ?? fetch;
+
+  const authDataFilePath = resolveAuthDataFilePath();
+  await loadAuthData(authDataFilePath, identityStore, tokenStore, (message) =>
+    app.log.warn(message)
+  );
   app.get("/", async () => {
     return {
       ok: true,
@@ -222,6 +323,20 @@ export async function authRoutes(app: FastifyInstance, deps: AuthDeps = { pendin
       return reply.status(502).send({ ok: false, error: accountResult.error });
     }
 
+    identityStore.set(entry.origin, accountResult.account);
+    tokenStore.set(entry.origin, {
+      accessToken,
+      tokenType,
+      scope,
+      updatedAt: new Date().toISOString(),
+    });
+
+    try {
+      await saveAuthData(authDataFilePath, identityStore, tokenStore);
+    } catch {
+      return reply.status(500).send({ ok: false, error: "Failed to persist auth data" });
+    }
+
     return reply.status(200).send({
       ok: true,
       instance: entry.origin,
@@ -229,6 +344,25 @@ export async function authRoutes(app: FastifyInstance, deps: AuthDeps = { pendin
       ...(tokenType ? { token_type: tokenType } : {}),
       ...(scope ? { scope } : {}),
     });
+  });
+
+  app.get<{ Querystring: { instance?: string } }>("/me", async (request, reply) => {
+    const { instance } = request.query;
+    if (!instance) {
+      return reply.status(400).send({ ok: false, error: "instance is required" });
+    }
+
+    const url = validateInstanceUrl(instance);
+    if (!url.ok) {
+      return reply.status(400).send({ ok: false, error: url.error });
+    }
+
+    const account = identityStore.get(url.origin);
+    if (!account) {
+      return reply.status(401).send({ ok: false, error: "Not logged in" });
+    }
+
+    return reply.status(200).send({ ok: true, account });
   });
 
 
