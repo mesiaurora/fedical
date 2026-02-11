@@ -10,7 +10,7 @@
     "start": "tsx apps/api/src/server.ts"
   },
   "keywords": [],
-  "author": "",
+  "author": "Kea Cook",
   "license": "ISC",
   "dependencies": {
     "fastify": "^5.7.2"

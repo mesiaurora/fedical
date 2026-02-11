@@ -11,6 +11,9 @@ This repo currently contains the backend starter: a Fastify + TypeScript server.
 - TypeScript
 - Fastify
 
+## Author
+Kea Cook
+
 ## Getting started
 
 ### Prerequisites
