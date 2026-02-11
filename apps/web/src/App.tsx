@@ -74,6 +74,7 @@ export default function App() {
     useState<PlannedPost["visibility"]>("public");
   const [formError, setFormError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [hasTriedSubmit, setHasTriedSubmit] = useState(false);
   const [activePost, setActivePost] = useState<PlannedPost | null>(null);
   const [editScheduledAt, setEditScheduledAt] = useState("");
   const [editText, setEditText] = useState("");
@@ -83,8 +84,11 @@ export default function App() {
   const [editError, setEditError] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [hasTriedEditSubmit, setHasTriedEditSubmit] = useState(false);
   const [showSent, setShowSent] = useState(true);
+  const [viewMode, setViewMode] = useState<"week" | "month">("week");
   const timezoneLabel = useMemo(() => getTimezoneLabel(), []);
+  const [currentMonthDate, setCurrentMonthDate] = useState<Date>(() => new Date());
 
   const weekDates = useMemo(
     () =>
@@ -95,6 +99,24 @@ export default function App() {
       }),
     [weekStartDate]
   );
+
+  const monthGridDates = useMemo(() => {
+    const firstOfMonth = new Date(currentMonthDate.getFullYear(), currentMonthDate.getMonth(), 1);
+    const start = getWeekStart(firstOfMonth);
+    const lastOfMonth = new Date(currentMonthDate.getFullYear(), currentMonthDate.getMonth() + 1, 0);
+    const end = new Date(lastOfMonth);
+    const dayIndex = (end.getDay() + 6) % 7;
+    end.setHours(0, 0, 0, 0);
+    end.setDate(end.getDate() + (6 - dayIndex));
+
+    const dates: Date[] = [];
+    const cursor = new Date(start);
+    while (cursor <= end) {
+      dates.push(new Date(cursor));
+      cursor.setDate(cursor.getDate() + 1);
+    }
+    return dates;
+  }, [currentMonthDate]);
 
   const normalizeDate = (value: Date | string) => new Date(value);
 
@@ -116,14 +138,27 @@ export default function App() {
     return Number.isNaN(normalized.getTime()) ? weekStartDate : normalized;
   })();
 
+  const getRangeForView = () => {
+    if (viewMode === "month") {
+      const start = new Date(monthGridDates[0]);
+      start.setHours(0, 0, 0, 0);
+      const end = new Date(monthGridDates[monthGridDates.length - 1]);
+      end.setHours(0, 0, 0, 0);
+      end.setDate(end.getDate() + 1);
+      return { from: start, to: end };
+    }
+    const from = new Date(weekStartDate);
+    from.setHours(0, 0, 0, 0);
+    const to = new Date(from);
+    to.setDate(from.getDate() + 7);
+    return { from, to };
+  };
+
   const fetchPosts = useCallback(
     async (signal?: AbortSignal) => {
       setIsLoading(true);
       setError(null);
-      const from = new Date(weekStartDate);
-      from.setHours(0, 0, 0, 0);
-      const to = new Date(from);
-      to.setDate(from.getDate() + 7);
+      const { from, to } = getRangeForView();
 
       const url =
         "/posts?instance=" +
@@ -144,13 +179,13 @@ export default function App() {
         if (err instanceof Error && err.name === "AbortError") {
           return;
         }
-        setError("Could not load posts for this week.");
+        setError("Could not load posts for this view.");
         setPosts([]);
       } finally {
         setIsLoading(false);
       }
     },
-    [instance, weekStartDate]
+    [instance, weekStartDate, viewMode, monthGridDates]
   );
 
   useEffect(() => {
@@ -328,6 +363,7 @@ export default function App() {
       setSelectedDay(targetDay);
     }
     setFormError(null);
+    setHasTriedSubmit(false);
     setFormText("");
     setFormVisibility("public");
     setFormScheduledAt(getDefaultScheduledAt(targetDay));
@@ -337,6 +373,7 @@ export default function App() {
   const openEditModal = (post: PlannedPost) => {
     setActivePost(post);
     setEditError(null);
+    setHasTriedEditSubmit(false);
     setEditText(post.text);
     setEditVisibility(post.visibility);
     setEditScheduledAt(getLocalDateTimeValue(post.scheduledAt));
@@ -353,6 +390,7 @@ export default function App() {
         : existing;
     setActivePost(post);
     setEditError(null);
+    setHasTriedEditSubmit(false);
     setEditText(post.text);
     setEditVisibility(post.visibility);
     setEditStatus("scheduled");
@@ -364,14 +402,17 @@ export default function App() {
     setEditError(null);
     setIsEditing(false);
     setIsDeleting(false);
+    setHasTriedEditSubmit(false);
   };
 
   const closeModal = () => {
     setIsModalOpen(false);
     setFormError(null);
+    setHasTriedSubmit(false);
   };
 
   const handleSubmit = useCallback(async () => {
+    setHasTriedSubmit(true);
     if (formText.trim().length === 0 || formText.length > 500) {
       return;
     }
@@ -415,6 +456,7 @@ export default function App() {
     if (!activePost) {
       return;
     }
+    setHasTriedEditSubmit(true);
     if (editText.trim().length === 0) {
       setEditError("Text is required.");
       return;
@@ -514,6 +556,16 @@ export default function App() {
     });
   };
 
+  const shiftMonth = (direction: number) => {
+    setCurrentMonthDate((current) => {
+      const next = new Date(current.getFullYear(), current.getMonth() + direction, 1);
+      return next;
+    });
+  };
+
+  const formatMonthTitle = (date: Date) =>
+    date.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+
   const characterCount = formText.length;
   const submitDisabledReason = (() => {
     if (isSubmitting) {
@@ -568,6 +620,24 @@ export default function App() {
     return "";
   })();
   const isEditDisabled = editDisabledReason !== "";
+
+  useEffect(() => {
+    if (!hasTriedSubmit) {
+      return;
+    }
+    if (!isSubmitDisabled) {
+      setHasTriedSubmit(false);
+    }
+  }, [hasTriedSubmit, isSubmitDisabled]);
+
+  useEffect(() => {
+    if (!hasTriedEditSubmit) {
+      return;
+    }
+    if (!isEditDisabled) {
+      setHasTriedEditSubmit(false);
+    }
+  }, [hasTriedEditSubmit, isEditDisabled]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -640,12 +710,45 @@ export default function App() {
           </div>
           <div className="flex flex-wrap items-center justify-between gap-4 border-t border-slate-200 pt-4">
             <div>
-              <h2 className="text-2xl font-semibold text-slate-900">
-                Week of {formatDate(weekStartDate)}
-              </h2>
-              <p className="text-sm text-slate-500">Draft a week of thoughtful posts.</p>
+              {viewMode === "week" ? (
+                <>
+                  <h2 className="text-2xl font-semibold text-slate-900">
+                    Week of {formatDate(weekStartDate)}
+                  </h2>
+                  <p className="text-sm text-slate-500">Draft a week of thoughtful posts.</p>
+                </>
+              ) : (
+                <>
+                  <h2 className="text-2xl font-semibold text-slate-900">
+                    {formatMonthTitle(currentMonthDate)}
+                  </h2>
+                  <p className="text-sm text-slate-500">Monthly overview of scheduled posts.</p>
+                </>
+              )}
             </div>
             <div className="flex flex-wrap items-center gap-3">
+              <div className="flex overflow-hidden rounded-full border border-slate-200 text-sm">
+                <button
+                  onClick={() => setViewMode("week")}
+                  className={`px-4 py-2 font-medium transition ${
+                    viewMode === "week"
+                      ? "bg-slate-900 text-white"
+                      : "bg-white text-slate-600 hover:bg-slate-100"
+                  }`}
+                >
+                  Week
+                </button>
+                <button
+                  onClick={() => setViewMode("month")}
+                  className={`px-4 py-2 font-medium transition ${
+                    viewMode === "month"
+                      ? "bg-slate-900 text-white"
+                      : "bg-white text-slate-600 hover:bg-slate-100"
+                  }`}
+                >
+                  Month
+                </button>
+              </div>
               <button
                 onClick={() => setShowSent((current) => !current)}
                 className="rounded-full border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
@@ -659,122 +762,195 @@ export default function App() {
                 Add post
               </button>
               <button
-                onClick={() => shiftWeek(-1)}
+                onClick={() => (viewMode === "week" ? shiftWeek(-1) : shiftMonth(-1))}
                 className="rounded-full border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
               >
-                Prev week
+                {viewMode === "week" ? "Prev week" : "Prev month"}
               </button>
               <button
-                onClick={() => shiftWeek(1)}
+                onClick={() => (viewMode === "week" ? shiftWeek(1) : shiftMonth(1))}
                 className="rounded-full bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-slate-800"
               >
-                Next week
+                {viewMode === "week" ? "Next week" : "Next month"}
               </button>
             </div>
           </div>
         </header>
 
         <section className="rounded-3xl border border-slate-200 bg-white/70 p-6 shadow-[0_16px_50px_rgba(15,23,42,0.06)]">
-          {isLoading && (
-            <div className="mb-4 rounded-2xl border border-indigo-100 bg-indigo-50/70 px-4 py-3 text-sm text-indigo-700">
-              Loading posts for this week...
-            </div>
-          )}
-          {error && (
-            <div className="mb-4 rounded-2xl border border-rose-100 bg-rose-50/80 px-4 py-3 text-sm text-rose-700">
-              {error}
-            </div>
-          )}
-          <div className="grid grid-cols-7 gap-4 text-sm font-semibold text-slate-500">
-            {weekDates.map((day) => (
-              <div key={day.label} className="text-center">
-                <div>{day.label}</div>
-                <div className="text-xs font-medium text-slate-400">
-                  {day.date.getDate()}
+          {viewMode === "week" ? (
+            <>
+              {isLoading && (
+                <div className="mb-4 rounded-2xl border border-indigo-100 bg-indigo-50/70 px-4 py-3 text-sm text-indigo-700">
+                  Loading posts for this week...
                 </div>
-              </div>
-            ))}
-          </div>
-          <div className="mt-4 grid grid-cols-7 gap-4">
-            {weekDates.map((day) => {
-              const dayKey = formatDate(day.date);
-              const dayPosts = (postsByDay.get(dayKey) ?? []).filter(
-                (post) => showSent || post.status !== "sent"
-              );
-              const isSelected = isSameDay(day.date, selectedDay);
-              const isPastDay = day.date.getTime() < todayStart.getTime();
-              return (
-                <div
-                  key={`${day.label}-cell`}
-                  onClick={() => {
-                    if (!isPastDay) {
-                      openModal(day.date);
-                    }
-                  }}
-                  className={`h-32 rounded-2xl border border-dashed p-3 text-xs shadow-inner transition ${
-                    isSameDay(day.date, today)
-                      ? "border-indigo-400 bg-indigo-50/80 text-indigo-600 shadow-[0_0_0_2px_rgba(99,102,241,0.15)]"
-                      : "border-slate-200 bg-white/90 text-slate-400 hover:border-slate-300 hover:bg-white"
-                  } ${isSelected ? "ring-2 ring-indigo-200" : ""} ${
-                    isPastDay ? "cursor-not-allowed opacity-60" : "cursor-pointer"
-                  }`}
-                >
-                  {dayPosts.length === 0 ? (
-                    <span>No posts yet</span>
-                  ) : (
-                    <div className="flex h-full flex-col gap-2 overflow-hidden">
-                      {dayPosts.map((post) => (
-                        <div
-                          key={post.id}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            openEditModal(post);
-                          }}
-                          className="rounded-xl border border-slate-200/70 bg-white/80 px-2 py-1 text-[11px] text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-white"
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="font-semibold text-slate-600">
-                              {formatTime(post.scheduledAt)}
-                            </span>
-                            <div className="flex items-center gap-1">
-                              <span
-                                className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${statusBadgeStyles[post.status]}`}
-                              >
-                                {post.status}
-                              </span>
-                              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] uppercase tracking-wide text-slate-500">
-                                {post.visibility}
-                              </span>
-                            </div>
-                          </div>
-                          <div className="mt-1 truncate text-slate-600">{post.text}</div>
-                          {post.status === "sending" && (
-                            <div className="mt-1 text-[10px] text-indigo-600">Sending…</div>
-                          )}
-                          {post.status === "failed" && (
-                            <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-rose-600">
-                              <span>
-                                {post.lastError ?? "Failed"} · attempts {post.attempts}
-                              </span>
-                              <button
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  openRetryModal(post);
-                                }}
-                                className="rounded-full border border-rose-200 px-2 py-0.5 text-[10px] font-semibold text-rose-600 hover:border-rose-300 hover:text-rose-700"
-                              >
-                                Retry
-                              </button>
-                            </div>
-                          )}
-                        </div>
-                      ))}
+              )}
+              {error && (
+                <div className="mb-4 rounded-2xl border border-rose-100 bg-rose-50/80 px-4 py-3 text-sm text-rose-700">
+                  {error}
+                </div>
+              )}
+              <div className="grid grid-cols-7 gap-4 text-sm font-semibold text-slate-500">
+                {weekDates.map((day) => (
+                  <div key={day.label} className="text-center">
+                    <div>{day.label}</div>
+                    <div className="text-xs font-medium text-slate-400">
+                      {day.date.getDate()}
                     </div>
-                  )}
+                  </div>
+                ))}
+              </div>
+              <div className="mt-4 grid grid-cols-7 gap-4">
+                {weekDates.map((day) => {
+                  const dayKey = formatDate(day.date);
+                  const dayPosts = (postsByDay.get(dayKey) ?? []).filter(
+                    (post) => showSent || post.status !== "sent"
+                  );
+                  const isSelected = isSameDay(day.date, selectedDay);
+                  const isPastDay = day.date.getTime() < todayStart.getTime();
+                  return (
+                    <div
+                      key={`${day.label}-cell`}
+                      onClick={() => {
+                        if (!isPastDay) {
+                          openModal(day.date);
+                        }
+                      }}
+                      className={`h-32 rounded-2xl border border-dashed p-3 text-xs shadow-inner transition ${
+                        isSameDay(day.date, today)
+                          ? "border-indigo-400 bg-indigo-50/80 text-indigo-600 shadow-[0_0_0_2px_rgba(99,102,241,0.15)]"
+                          : "border-slate-200 bg-white/90 text-slate-400 hover:border-slate-300 hover:bg-white"
+                      } ${isSelected ? "ring-2 ring-indigo-200" : ""} ${
+                        isPastDay ? "cursor-not-allowed opacity-60" : "cursor-pointer"
+                      }`}
+                    >
+                      {dayPosts.length === 0 ? (
+                        <span>No posts yet</span>
+                      ) : (
+                        <div className="flex h-full flex-col gap-2 overflow-hidden">
+                          {dayPosts.map((post) => (
+                            <div
+                              key={post.id}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                openEditModal(post);
+                              }}
+                              className="rounded-xl border border-slate-200/70 bg-white/80 px-2 py-1 text-[11px] text-slate-700 shadow-sm transition hover:border-slate-300 hover:bg-white"
+                            >
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="font-semibold text-slate-600">
+                                  {formatTime(post.scheduledAt)}
+                                </span>
+                                <div className="flex items-center gap-1">
+                                  <span
+                                    className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${statusBadgeStyles[post.status]}`}
+                                  >
+                                    {post.status}
+                                  </span>
+                                  <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] uppercase tracking-wide text-slate-500">
+                                    {post.visibility}
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="mt-1 truncate text-slate-600">{post.text}</div>
+                              {post.status === "sending" && (
+                                <div className="mt-1 text-[10px] text-indigo-600">Sending…</div>
+                              )}
+                              {post.status === "failed" && (
+                                <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-rose-600">
+                                  <span>
+                                    {post.lastError ?? "Failed"} · attempts {post.attempts}
+                                  </span>
+                                  <button
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      openRetryModal(post);
+                                    }}
+                                    className="rounded-full border border-rose-200 px-2 py-0.5 text-[10px] font-semibold text-rose-600 hover:border-rose-300 hover:text-rose-700"
+                                  >
+                                    Retry
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          ) : (
+            <>
+              {isLoading && (
+                <div className="mb-4 rounded-2xl border border-indigo-100 bg-indigo-50/70 px-4 py-3 text-sm text-indigo-700">
+                  Loading posts for this month...
                 </div>
-              );
-            })}
-          </div>
+              )}
+              {error && (
+                <div className="mb-4 rounded-2xl border border-rose-100 bg-rose-50/80 px-4 py-3 text-sm text-rose-700">
+                  {error}
+                </div>
+              )}
+              <div className="grid grid-cols-7 gap-4 text-sm font-semibold text-slate-500">
+                {dayLabels.map((day) => (
+                  <div key={day} className="text-center">
+                    {day}
+                  </div>
+                ))}
+              </div>
+              <div className="mt-4 grid grid-cols-7 gap-3">
+                {monthGridDates.map((date) => {
+                  const isOutside = date.getMonth() !== currentMonthDate.getMonth();
+                  const isToday = isSameDay(date, today);
+                  const dayKey = formatDate(date);
+                  const dayPosts = (postsByDay.get(dayKey) ?? []).filter(
+                    (post) => showSent || post.status !== "sent"
+                  );
+                  const visiblePosts = dayPosts.slice(0, 2);
+                  const overflowCount = dayPosts.length - visiblePosts.length;
+                  return (
+                    <div
+                      key={date.toISOString()}
+                      onClick={() => openModal(date)}
+                      className={`h-28 rounded-2xl border border-dashed p-3 text-xs transition ${
+                        isOutside ? "border-slate-100 text-slate-300" : "border-slate-200 text-slate-500"
+                      } ${isToday ? "bg-indigo-50/70 text-indigo-600" : "bg-white"} cursor-pointer hover:border-slate-300`}
+                    >
+                      <div className="text-sm font-semibold">{date.getDate()}</div>
+                      <div className="mt-2 flex flex-col gap-1">
+                        {visiblePosts.map((post) => (
+                          <div
+                            key={post.id}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              openEditModal(post);
+                            }}
+                            className="flex items-center gap-1 overflow-hidden rounded-full border border-slate-200/70 bg-white/80 px-2 py-0.5 text-[10px] text-slate-600 shadow-sm"
+                          >
+                            <span className="shrink-0 font-semibold">{formatTime(post.scheduledAt)}</span>
+                            <span className="shrink-0 text-slate-400">·</span>
+                            <span className="min-w-0 flex-1 truncate">
+                              {post.text}
+                            </span>
+                            <span
+                              className={`ml-1 shrink-0 rounded-full px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide ${statusBadgeStyles[post.status]}`}
+                            >
+                              {post.status}
+                            </span>
+                          </div>
+                        ))}
+                        {overflowCount > 0 && (
+                          <div className="text-[10px] text-slate-400">+{overflowCount} more</div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
         </section>
       </div>
 
@@ -854,25 +1030,27 @@ export default function App() {
                 </div>
               )}
 
-              <div className="flex items-center justify-end gap-3">
-                <button
-                  onClick={closeModal}
-                  className="rounded-full border border-slate-200 px-4 py-2 text-sm text-slate-600 hover:border-slate-300 hover:text-slate-800"
-                >
-                  Cancel
-                </button>
-                <div className="flex flex-col items-end gap-1">
+              <div className="flex items-end justify-between gap-4">
+                <span className="text-[11px] text-slate-400">Cmd/Ctrl+Enter to submit</span>
+                <div className="flex items-end gap-3">
                   <button
-                    onClick={handleSubmit}
-                    disabled={isSubmitDisabled}
-                    className="rounded-full bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+                    onClick={closeModal}
+                    className="rounded-full border border-slate-200 px-4 py-2 text-sm text-slate-600 hover:border-slate-300 hover:text-slate-800"
                   >
-                    {isSubmitting ? "Saving..." : "Save post"}
+                    Cancel
                   </button>
-                  {isSubmitDisabled && (
-                    <span className="text-[11px] text-rose-500">{submitDisabledReason}</span>
-                  )}
-                  <span className="text-[11px] text-slate-400">Cmd/Ctrl+Enter to submit</span>
+                  <div className="flex flex-col items-end gap-1">
+                    <span className="h-4 text-[11px] text-rose-500">
+                      {hasTriedSubmit && isSubmitDisabled ? submitDisabledReason : "\u00A0"}
+                    </span>
+                    <button
+                      onClick={handleSubmit}
+                      disabled={isSubmitDisabled}
+                      className="rounded-full bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+                    >
+                      {isSubmitting ? "Saving..." : "Save post"}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -976,7 +1154,7 @@ export default function App() {
                 </div>
               )}
 
-              <div className="flex items-center justify-between gap-3">
+              <div className="flex items-end justify-between gap-3">
                 <button
                   onClick={handleDelete}
                   disabled={isDeleting}
@@ -985,6 +1163,9 @@ export default function App() {
                   {isDeleting ? "Deleting..." : "Delete"}
                 </button>
                 <div className="flex flex-col items-end gap-1 text-right">
+                  <span className="h-4 text-[11px] text-rose-500">
+                    {hasTriedEditSubmit && isEditDisabled ? editDisabledReason : "\u00A0"}
+                  </span>
                   <button
                     onClick={handleUpdate}
                     disabled={isEditDisabled}
@@ -992,9 +1173,6 @@ export default function App() {
                   >
                     {isEditing ? "Saving..." : "Save changes"}
                   </button>
-                  {isEditDisabled && (
-                    <span className="text-[11px] text-rose-500">{editDisabledReason}</span>
-                  )}
                 </div>
               </div>
             </div>
