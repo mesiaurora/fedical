@@ -133,6 +133,9 @@ export default function App() {
   const today = new Date();
   const todayStart = new Date(today);
   todayStart.setHours(0, 0, 0, 0);
+  const onThisDayMonth = todayStart.getMonth();
+  const onThisDayDate = todayStart.getDate();
+  const onThisDayYear = todayStart.getFullYear();
   const safeSelectedDay = (() => {
     const normalized = normalizeDate(selectedDay);
     return Number.isNaN(normalized.getTime()) ? weekStartDate : normalized;
@@ -305,11 +308,86 @@ export default function App() {
     return map;
   }, [posts]);
 
+  const [onThisDayPosts, setOnThisDayPosts] = useState<PlannedPost[]>([]);
+  const [onThisDayLoading, setOnThisDayLoading] = useState(false);
+  const [onThisDayError, setOnThisDayError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const loadOnThisDay = async () => {
+      if (!account) {
+        setOnThisDayPosts([]);
+        setOnThisDayError(null);
+        setOnThisDayLoading(false);
+        return;
+      }
+
+      setOnThisDayLoading(true);
+      setOnThisDayError(null);
+      const from = new Date("1970-01-01T00:00:00.000Z");
+      const to = new Date();
+      to.setDate(to.getDate() + 1);
+
+      const url =
+        "/posts?instance=" +
+        encodeURIComponent(instance) +
+        "&from=" +
+        encodeURIComponent(from.toISOString()) +
+        "&to=" +
+        encodeURIComponent(to.toISOString());
+
+      try {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) {
+          throw new Error(`Failed to load post history (${res.status})`);
+        }
+        const data = (await res.json()) as { posts?: PlannedPost[] };
+        const history = Array.isArray(data.posts) ? data.posts : [];
+        const matches = history
+          .filter((post) => post.status === "sent")
+          .filter((post) => {
+            const scheduled = new Date(post.scheduledAt);
+            if (Number.isNaN(scheduled.getTime())) {
+              return false;
+            }
+            return (
+              scheduled.getMonth() === onThisDayMonth &&
+              scheduled.getDate() === onThisDayDate &&
+              scheduled.getFullYear() < onThisDayYear
+            );
+          })
+          .sort((a, b) => b.scheduledAt.localeCompare(a.scheduledAt));
+        setOnThisDayPosts(matches);
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") {
+          return;
+        }
+        setOnThisDayError("Could not load On This Day posts.");
+        setOnThisDayPosts([]);
+      } finally {
+        setOnThisDayLoading(false);
+      }
+    };
+
+    void loadOnThisDay();
+    return () => controller.abort();
+  }, [account, instance, onThisDayDate, onThisDayMonth, onThisDayYear]);
+
   const formatTime = (iso: string) => {
     const date = new Date(iso);
     const hours = String(date.getHours()).padStart(2, "0");
     const minutes = String(date.getMinutes()).padStart(2, "0");
     return `${hours}:${minutes}`;
+  };
+
+  const formatLongDate = (iso: string) => {
+    const date = new Date(iso);
+    return date.toLocaleDateString(undefined, {
+      weekday: "short",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
   };
 
   const statusBadgeStyles: Record<PlannedPost["status"], string> = {
@@ -756,7 +834,7 @@ export default function App() {
                 {showSent ? "Hide sent" : "Show sent"}
               </button>
               <button
-                onClick={openModal}
+                onClick={() => openModal()}
                 className="rounded-full border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-700 transition hover:border-indigo-300 hover:bg-indigo-100"
               >
                 Add post
@@ -950,6 +1028,55 @@ export default function App() {
                 })}
               </div>
             </>
+          )}
+        </section>
+
+        <section className="rounded-3xl border border-slate-200 bg-white/70 p-6 shadow-[0_16px_50px_rgba(15,23,42,0.06)]">
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <h3 className="text-xl font-semibold text-slate-900">On This Day</h3>
+              <p className="text-sm text-slate-500">
+                Your sent posts from {todayStart.toLocaleDateString(undefined, { month: "long", day: "numeric" })} in previous years.
+              </p>
+            </div>
+          </div>
+
+          {!account ? (
+            <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
+              Connect an account to view your On This Day history.
+            </div>
+          ) : onThisDayLoading ? (
+            <div className="mt-4 rounded-2xl border border-indigo-100 bg-indigo-50/70 px-4 py-3 text-sm text-indigo-700">
+              Loading On This Day posts...
+            </div>
+          ) : onThisDayError ? (
+            <div className="mt-4 rounded-2xl border border-rose-100 bg-rose-50/80 px-4 py-3 text-sm text-rose-700">
+              {onThisDayError}
+            </div>
+          ) : onThisDayPosts.length === 0 ? (
+            <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
+              No sent posts found for this date in previous years.
+            </div>
+          ) : (
+            <div className="mt-4 grid gap-3">
+              {onThisDayPosts.map((post) => (
+                <div
+                  key={`history-${post.id}`}
+                  className="rounded-2xl border border-slate-200 bg-white/90 px-4 py-3 shadow-sm"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+                    <span className="font-semibold text-slate-700">{formatLongDate(post.scheduledAt)}</span>
+                    <div className="flex items-center gap-2">
+                      <span>{formatTime(post.scheduledAt)}</span>
+                      <span className="rounded-full bg-slate-100 px-2 py-0.5 uppercase tracking-wide text-slate-600">
+                        {post.visibility}
+                      </span>
+                    </div>
+                  </div>
+                  <p className="mt-2 text-sm text-slate-700">{post.text}</p>
+                </div>
+              ))}
+            </div>
           )}
         </section>
       </div>
