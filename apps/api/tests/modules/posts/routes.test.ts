@@ -6,7 +6,9 @@ describe("POST /posts", () => {
   it("creates a planned post", async () => {
     const app = Fastify();
     const posts = new Map();
-    await postsRoutes(app, { posts });
+    const identityStore = new Map<string, { id: string }>();
+    identityStore.set("https://example.com", { id: "acct-1" });
+    await postsRoutes(app, { posts, identityStore });
     await app.ready();
 
     try {
@@ -42,7 +44,9 @@ describe("GET /posts", () => {
   it("returns posts in range sorted by scheduledAt", async () => {
     const app = Fastify();
     const posts = new Map();
-    await postsRoutes(app, { posts });
+    const identityStore = new Map<string, { id: string }>();
+    identityStore.set("https://example.com", { id: "acct-1" });
+    await postsRoutes(app, { posts, identityStore });
     await app.ready();
 
     const origin = "https://example.com";
@@ -50,6 +54,7 @@ describe("GET /posts", () => {
     const makePost = (id: string, offsetMinutes: number) => ({
       id,
       instance: origin,
+      ownerAccountId: "acct-1",
       scheduledAt: new Date(base + offsetMinutes * 60_000).toISOString(),
       text: `post-${id}`,
       visibility: "public" as const,
@@ -78,6 +83,72 @@ describe("GET /posts", () => {
       const body = JSON.parse(res.body) as { ok: boolean; posts: Array<{ id: string }> };
       expect(body.ok).toBe(true);
       expect(body.posts.map((post) => post.id)).toEqual(["a", "b"]);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("returns only posts owned by the currently logged-in account on same instance", async () => {
+    const app = Fastify();
+    const posts = new Map();
+    const identityStore = new Map<string, { id: string }>();
+    identityStore.set("https://example.com", { id: "acct-a" });
+    await postsRoutes(app, { posts, identityStore });
+    await app.ready();
+
+    const origin = "https://example.com";
+    const base = new Date("2026-02-10T12:00:00.000Z").getTime();
+    const postForA = {
+      id: "owned-a",
+      instance: origin,
+      ownerAccountId: "acct-a",
+      scheduledAt: new Date(base + 10 * 60_000).toISOString(),
+      text: "A",
+      visibility: "public" as const,
+      status: "draft" as const,
+      attempts: 0,
+      createdAt: new Date(base).toISOString(),
+      updatedAt: new Date(base).toISOString(),
+    };
+    const postForB = {
+      id: "owned-b",
+      instance: origin,
+      ownerAccountId: "acct-b",
+      scheduledAt: new Date(base + 20 * 60_000).toISOString(),
+      text: "B",
+      visibility: "public" as const,
+      status: "draft" as const,
+      attempts: 0,
+      createdAt: new Date(base).toISOString(),
+      updatedAt: new Date(base).toISOString(),
+    };
+    const legacyPost = {
+      id: "legacy",
+      instance: origin,
+      scheduledAt: new Date(base + 30 * 60_000).toISOString(),
+      text: "legacy",
+      visibility: "public" as const,
+      status: "draft" as const,
+      attempts: 0,
+      createdAt: new Date(base).toISOString(),
+      updatedAt: new Date(base).toISOString(),
+    };
+    posts.set(postForA.id, postForA);
+    posts.set(postForB.id, postForB);
+    posts.set(legacyPost.id, legacyPost);
+
+    try {
+      const from = new Date(base).toISOString();
+      const to = new Date(base + 60 * 60_000).toISOString();
+      const res = await app.inject({
+        method: "GET",
+        url: `/posts?instance=${encodeURIComponent(origin)}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body) as { ok: boolean; posts: Array<{ id: string }> };
+      expect(body.ok).toBe(true);
+      expect(body.posts.map((post) => post.id)).toEqual(["owned-a"]);
     } finally {
       await app.close();
     }
@@ -176,7 +247,9 @@ describe("PATCH /posts/:id", () => {
   it("updates a post and bumps updatedAt", async () => {
     const app = Fastify();
     const posts = new Map();
-    await postsRoutes(app, { posts });
+    const identityStore = new Map<string, { id: string }>();
+    identityStore.set("https://example.com", { id: "acct-1" });
+    await postsRoutes(app, { posts, identityStore });
     await app.ready();
 
     const now = Date.now();
@@ -184,6 +257,7 @@ describe("PATCH /posts/:id", () => {
     const post = {
       id: "post-1",
       instance: "https://example.com",
+      ownerAccountId: "acct-1",
       scheduledAt: new Date(now + 60_000).toISOString(),
       text: "original",
       visibility: "public" as const,
@@ -215,13 +289,49 @@ describe("PATCH /posts/:id", () => {
       await app.close();
     }
   });
+
+  it("returns 403 when trying to update another account's post", async () => {
+    const app = Fastify();
+    const posts = new Map();
+    const identityStore = new Map<string, { id: string }>();
+    identityStore.set("https://example.com", { id: "acct-a" });
+    await postsRoutes(app, { posts, identityStore });
+    await app.ready();
+
+    const post = {
+      id: "post-forbidden-update",
+      instance: "https://example.com",
+      ownerAccountId: "acct-b",
+      scheduledAt: new Date(Date.now() + 60_000).toISOString(),
+      text: "original",
+      visibility: "public" as const,
+      status: "draft" as const,
+      attempts: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    posts.set(post.id, post);
+
+    try {
+      const res = await app.inject({
+        method: "PATCH",
+        url: `/posts/${post.id}`,
+        payload: { text: "updated text" },
+      });
+      expect(res.statusCode).toBe(403);
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 describe("DELETE /posts/:id", () => {
   it("deletes a post and returns 404 when deleting again", async () => {
     const app = Fastify();
     const posts = new Map();
-    await postsRoutes(app, { posts });
+    const identityStore = new Map<string, { id: string }>();
+    identityStore.set("https://example.com", { id: "acct-1" });
+    await postsRoutes(app, { posts, identityStore });
     await app.ready();
 
     const origin = "https://example.com";
@@ -229,6 +339,7 @@ describe("DELETE /posts/:id", () => {
     const post = {
       id: "post-delete-1",
       instance: origin,
+      ownerAccountId: "acct-1",
       scheduledAt: new Date(base + 10 * 60_000).toISOString(),
       text: "delete me",
       visibility: "public" as const,
@@ -266,13 +377,48 @@ describe("DELETE /posts/:id", () => {
       await app.close();
     }
   });
+
+  it("returns 403 when trying to delete another account's post", async () => {
+    const app = Fastify();
+    const posts = new Map();
+    const identityStore = new Map<string, { id: string }>();
+    identityStore.set("https://example.com", { id: "acct-a" });
+    await postsRoutes(app, { posts, identityStore });
+    await app.ready();
+
+    const post = {
+      id: "post-forbidden-delete",
+      instance: "https://example.com",
+      ownerAccountId: "acct-b",
+      scheduledAt: new Date(Date.now() + 60_000).toISOString(),
+      text: "delete me",
+      visibility: "public" as const,
+      status: "draft" as const,
+      attempts: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    posts.set(post.id, post);
+
+    try {
+      const res = await app.inject({
+        method: "DELETE",
+        url: `/posts/${post.id}`,
+      });
+      expect(res.statusCode).toBe(403);
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 describe("POST /posts validation", () => {
   it("rejects past scheduledAt", async () => {
     const app = Fastify();
     const posts = new Map();
-    await postsRoutes(app, { posts });
+    const identityStore = new Map<string, { id: string }>();
+    identityStore.set("https://example.com", { id: "acct-1" });
+    await postsRoutes(app, { posts, identityStore });
     await app.ready();
 
     try {
@@ -300,13 +446,16 @@ describe("PATCH /posts/:id validation", () => {
   it("rejects invalid scheduledAt", async () => {
     const app = Fastify();
     const posts = new Map();
-    await postsRoutes(app, { posts });
+    const identityStore = new Map<string, { id: string }>();
+    identityStore.set("https://example.com", { id: "acct-1" });
+    await postsRoutes(app, { posts, identityStore });
     await app.ready();
 
     const base = new Date();
     const post = {
       id: "post-invalid-date",
       instance: "https://example.com",
+      ownerAccountId: "acct-1",
       scheduledAt: new Date(base.getTime() + 60_000).toISOString(),
       text: "original",
       visibility: "public" as const,
@@ -335,13 +484,16 @@ describe("PATCH /posts/:id validation", () => {
   it("rejects past scheduledAt when status is not draft", async () => {
     const app = Fastify();
     const posts = new Map();
-    await postsRoutes(app, { posts });
+    const identityStore = new Map<string, { id: string }>();
+    identityStore.set("https://example.com", { id: "acct-1" });
+    await postsRoutes(app, { posts, identityStore });
     await app.ready();
 
     const base = new Date();
     const post = {
       id: "post-past-when-scheduled",
       instance: "https://example.com",
+      ownerAccountId: "acct-1",
       scheduledAt: new Date(base.getTime() + 60_000).toISOString(),
       text: "original",
       visibility: "public" as const,

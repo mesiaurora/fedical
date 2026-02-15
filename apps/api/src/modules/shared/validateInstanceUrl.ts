@@ -9,8 +9,18 @@ export const validateInstanceUrl = (
     return { ok: false, error: "Invalid instanceUrl" };
   }
 
-  if (instanceUrl.protocol !== "https:" && instanceUrl.protocol !== "http:") {
-    return { ok: false, error: "instanceUrl must use https or http" };
+  if (instanceUrl.protocol !== "https:") {
+    return { ok: false, error: "instanceUrl must use https" };
+  }
+
+  const hostname = instanceUrl.hostname.toLowerCase();
+  if (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname === "0.0.0.0"
+  ) {
+    return { ok: false, error: "instanceUrl must not target localhost" };
   }
 
   return { ok: true, origin: instanceUrl.origin };

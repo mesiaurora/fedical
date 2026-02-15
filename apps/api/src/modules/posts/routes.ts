@@ -20,6 +20,7 @@ type UpdatePostBody = Partial<{
 type PlannedPost = {
   id: string;
   instance: string;
+  ownerAccountId?: string;
   scheduledAt: string;
   text: string;
   visibility: "public" | "unlisted" | "private" | "direct";
@@ -131,6 +132,7 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
   const tokenStore = options.tokenStore;
   const identityStore = options.identityStore;
   const fetchFn = options.fetchFn ?? fetch;
+  const getCurrentAccountIdForOrigin = (origin: string) => identityStore?.get(origin)?.id;
 
   if (shouldPersist) {
     await loadPostsFromDisk(dataFilePath, store, (message) => app.log.warn(message));
@@ -181,6 +183,25 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
           continue;
         }
         processingIds.add(post.id);
+        const currentAccountId = identityStore?.get(post.instance)?.id;
+        if (!post.ownerAccountId) {
+          post.status = "failed";
+          post.lastError = "missing_owner_account";
+          post.attempts += 1;
+          post.updatedAt = new Date().toISOString();
+          store.posts.set(post.id, post);
+          processingIds.delete(post.id);
+          continue;
+        }
+        if (!currentAccountId || post.ownerAccountId !== currentAccountId) {
+          post.status = "failed";
+          post.lastError = "account_mismatch";
+          post.attempts += 1;
+          post.updatedAt = new Date().toISOString();
+          store.posts.set(post.id, post);
+          processingIds.delete(post.id);
+          continue;
+        }
         const token = tokenStore.get(post.instance);
         if (!token) {
           post.status = "failed";
@@ -234,6 +255,10 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
     if (!instanceResult.ok) {
       return reply.status(400).send({ ok: false, error: instanceResult.error });
     }
+    const ownerAccountId = getCurrentAccountIdForOrigin(instanceResult.origin);
+    if (!ownerAccountId) {
+      return reply.status(401).send({ ok: false, error: "Not logged in" });
+    }
 
     const scheduledDate = new Date(scheduledAt);
     if (Number.isNaN(scheduledDate.getTime())) {
@@ -257,6 +282,7 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
     const post: PlannedPost = {
       id: crypto.randomUUID(),
       instance: instanceResult.origin,
+      ...(ownerAccountId ? { ownerAccountId } : {}),
       scheduledAt: scheduledDate.toISOString(),
       text,
       visibility: visibilityValue,
@@ -301,9 +327,14 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
 
       const fromMs = fromDate.getTime();
       const toMs = toDate.getTime();
+      const accountId = getCurrentAccountIdForOrigin(instanceResult.origin);
+      if (!accountId) {
+        return reply.status(401).send({ ok: false, error: "Not logged in" });
+      }
 
       const postsInRange = Array.from(store.posts.values())
         .filter((post) => post.instance === instanceResult.origin)
+        .filter((post) => post.ownerAccountId === accountId)
         .filter((post) => {
           const scheduledMs = new Date(post.scheduledAt).getTime();
           return scheduledMs >= fromMs && scheduledMs < toMs;
@@ -381,6 +412,13 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
       if (!post) {
         return reply.status(404).send({ ok: false, error: "Post not found" });
       }
+      const accountId = getCurrentAccountIdForOrigin(post.instance);
+      if (!accountId) {
+        return reply.status(401).send({ ok: false, error: "Not logged in" });
+      }
+      if (!post.ownerAccountId || post.ownerAccountId !== accountId) {
+        return reply.status(403).send({ ok: false, error: "Forbidden for this account" });
+      }
 
       const allowedVisibility = ["public", "unlisted", "private", "direct"] as const;
       const allowedStatus = ["draft", "scheduled", "sending", "sent", "failed", "canceled"] as const;
@@ -453,8 +491,16 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
 
   app.delete<{ Params: { id: string } }>("/posts/:id", async (request, reply) => {
     const { id } = request.params;
-    if (!store.posts.has(id)) {
+    const post = store.posts.get(id);
+    if (!post) {
       return reply.status(404).send({ ok: false, error: "Post not found" });
+    }
+    const accountId = getCurrentAccountIdForOrigin(post.instance);
+    if (!accountId) {
+      return reply.status(401).send({ ok: false, error: "Not logged in" });
+    }
+    if (!post.ownerAccountId || post.ownerAccountId !== accountId) {
+      return reply.status(403).send({ ok: false, error: "Forbidden for this account" });
     }
 
     store.posts.delete(id);

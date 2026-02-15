@@ -30,6 +30,7 @@ const getTimezoneLabel = () => {
 type PlannedPost = {
   id: string;
   instance: string;
+  ownerAccountId?: string;
   scheduledAt: string;
   text: string;
   visibility: "public" | "unlisted" | "private" | "direct";
@@ -41,6 +42,7 @@ type PlannedPost = {
 };
 
 type AccountIdentity = {
+  id: string;
   username: string;
   acct: string;
   displayName: string;
@@ -196,7 +198,7 @@ export default function App() {
         setIsLoading(false);
       }
     },
-    [instance, weekStartDate, viewMode, monthGridDates]
+    [instance, weekStartDate, viewMode, monthGridDates, account?.id]
   );
 
   useEffect(() => {

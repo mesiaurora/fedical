@@ -82,6 +82,31 @@ describe("/authorize", () => {
       await app.close();
     }
   });
+
+  it("rejects redirect origins that are not allowlisted", async () => {
+    const { app, clientRegistrations } = await buildApp();
+    const origin = "https://example.com";
+    const clientId = "client-123";
+    clientRegistrations.set(`${origin}::${clientId}`, {
+      clientSecret: "secret-123",
+      redirectUri: "http://127.0.0.1:3000/auth/callback",
+    });
+
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: `/authorize?instance=${encodeURIComponent(origin)}&clientId=${clientId}&redirect=${encodeURIComponent("https://evil.example/callback")}`,
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body)).toEqual({
+        ok: false,
+        error: "redirect origin is not allowed",
+      });
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 describe("/callback", () => {

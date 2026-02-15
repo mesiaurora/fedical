@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { validateInstanceUrl } from "../shared/validateInstanceUrl.js";
 
@@ -38,6 +39,14 @@ type TokenRecord = {
   scope?: string;
   updatedAt: string;
 };
+
+type PersistedTokenRecord = {
+  accessToken?: string;
+  accessTokenEncrypted?: string;
+  tokenType?: string;
+  scope?: string;
+  updatedAt: string;
+};
 type AuthStores = {
   pendingStates: Map<string, PendingState>;
   clientRegistrations: Map<string, ClientRegistration>;
@@ -53,6 +62,71 @@ const tokens = new Map<string, TokenRecord>();
 
 export const getAuthTokenStore = () => tokens;
 export const getAuthIdentityStore = () => identities;
+
+const defaultAllowedRedirectOrigins = ["http://127.0.0.1:5173", "http://localhost:5173"];
+const getAllowedRedirectOrigins = () => {
+  const configured = process.env.FEDICAL_ALLOWED_REDIRECT_ORIGINS;
+  const list = configured
+    ? configured
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0)
+    : defaultAllowedRedirectOrigins;
+
+  return new Set(
+    list
+      .map((value) => {
+        try {
+          return new URL(value).origin;
+        } catch {
+          return "";
+        }
+      })
+      .filter((value) => value.length > 0)
+  );
+};
+
+const getAuthEncryptionKey = () => {
+  const raw = process.env.FEDICAL_AUTH_ENCRYPTION_KEY;
+  if (!raw) {
+    return null;
+  }
+  return createHash("sha256").update(raw).digest();
+};
+
+const encryptAccessToken = (token: string) => {
+  const key = getAuthEncryptionKey();
+  if (!key) {
+    return null;
+  }
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(token, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, encrypted]).toString("base64");
+};
+
+const decryptAccessToken = (payload: string) => {
+  const key = getAuthEncryptionKey();
+  if (!key) {
+    return null;
+  }
+  try {
+    const bytes = Buffer.from(payload, "base64");
+    if (bytes.length < 29) {
+      return null;
+    }
+    const iv = bytes.subarray(0, 12);
+    const tag = bytes.subarray(12, 28);
+    const encrypted = bytes.subarray(28);
+    const decipher = createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAuthTag(tag);
+    const plain = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    return plain.toString("utf8");
+  } catch {
+    return null;
+  }
+};
 
 const resolveAuthDataFilePath = () => {
   const explicitFile = process.env.FEDICAL_AUTH_FILE;
@@ -79,7 +153,7 @@ const loadAuthData = async (
     try {
       const data = JSON.parse(raw) as {
         identities?: Record<string, AccountIdentity>;
-        tokens?: Record<string, TokenRecord>;
+        tokens?: Record<string, PersistedTokenRecord>;
       };
       if (data.identities && typeof data.identities === "object") {
         for (const [origin, identity] of Object.entries(data.identities)) {
@@ -90,8 +164,22 @@ const loadAuthData = async (
       }
       if (data.tokens && typeof data.tokens === "object") {
         for (const [origin, token] of Object.entries(data.tokens)) {
-          if (token && typeof token.accessToken === "string") {
-            tokenStore.set(origin, token);
+          if (!token) {
+            continue;
+          }
+          let accessToken = "";
+          if (typeof token.accessTokenEncrypted === "string") {
+            accessToken = decryptAccessToken(token.accessTokenEncrypted) ?? "";
+          } else if (typeof token.accessToken === "string") {
+            accessToken = token.accessToken;
+          }
+          if (accessToken) {
+            tokenStore.set(origin, {
+              accessToken,
+              tokenType: token.tokenType,
+              scope: token.scope,
+              updatedAt: token.updatedAt,
+            });
           }
         }
       }
@@ -117,7 +205,25 @@ const saveAuthData = async (
   const payload = JSON.stringify(
     {
       identities: Object.fromEntries(identityStore.entries()),
-      tokens: Object.fromEntries(tokenStore.entries()),
+      tokens: Object.fromEntries(
+        Array.from(tokenStore.entries())
+          .map(([origin, token]) => {
+            const encrypted = encryptAccessToken(token.accessToken);
+            if (!encrypted) {
+              return null;
+            }
+            return [
+              origin,
+              {
+                accessTokenEncrypted: encrypted,
+                tokenType: token.tokenType,
+                scope: token.scope,
+                updatedAt: token.updatedAt,
+              },
+            ] as const;
+          })
+          .filter((entry): entry is readonly [string, PersistedTokenRecord] => entry !== null)
+      ),
     },
     null,
     2
@@ -141,6 +247,12 @@ export async function authRoutes(app: FastifyInstance, options: AuthDeps = {}) {
 
   const shouldPersist = options.persist ?? (options.tokens === undefined && options.identities === undefined);
   const authDataFilePath = options.dataFile ?? resolveAuthDataFilePath();
+  const allowedRedirectOrigins = getAllowedRedirectOrigins();
+  if (shouldPersist && !getAuthEncryptionKey()) {
+    app.log.warn(
+      "FEDICAL_AUTH_ENCRYPTION_KEY is not set; auth tokens will not be persisted to disk."
+    );
+  }
   if (shouldPersist) {
     await loadAuthData(authDataFilePath, identityStore, tokenStore, (message) =>
       app.log.warn(message)
@@ -281,11 +393,16 @@ export async function authRoutes(app: FastifyInstance, options: AuthDeps = {}) {
     if (redirect) {
       try {
         const redirectUrl = new URL(redirect);
-        if (redirectUrl.protocol === "https:" || redirectUrl.protocol === "http:") {
+        if (
+          (redirectUrl.protocol === "https:" || redirectUrl.protocol === "http:") &&
+          allowedRedirectOrigins.has(redirectUrl.origin)
+        ) {
           redirectUri = redirectUrl.toString();
+        } else {
+          return reply.status(400).send({ ok: false, error: "redirect origin is not allowed" });
         }
       } catch {
-        // ignore invalid redirect
+        return reply.status(400).send({ ok: false, error: "redirect must be a valid URL" });
       }
     }
 
