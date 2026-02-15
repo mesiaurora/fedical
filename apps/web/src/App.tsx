@@ -47,6 +47,14 @@ type AccountIdentity = {
   avatar?: string;
 };
 
+type OnThisDayPost = {
+  id: string;
+  createdAt: string;
+  text: string;
+  visibility: "public" | "unlisted" | "private" | "direct";
+  url?: string;
+};
+
 export default function App() {
   const getInitialInstance = () => {
     if (typeof window === "undefined") {
@@ -308,7 +316,7 @@ export default function App() {
     return map;
   }, [posts]);
 
-  const [onThisDayPosts, setOnThisDayPosts] = useState<PlannedPost[]>([]);
+  const [onThisDayPosts, setOnThisDayPosts] = useState<OnThisDayPost[]>([]);
   const [onThisDayLoading, setOnThisDayLoading] = useState(false);
   const [onThisDayError, setOnThisDayError] = useState<string | null>(null);
 
@@ -324,40 +332,27 @@ export default function App() {
 
       setOnThisDayLoading(true);
       setOnThisDayError(null);
-      const from = new Date("1970-01-01T00:00:00.000Z");
-      const to = new Date();
-      to.setDate(to.getDate() + 1);
-
       const url =
-        "/posts?instance=" +
+        "/posts/on-this-day?instance=" +
         encodeURIComponent(instance) +
-        "&from=" +
-        encodeURIComponent(from.toISOString()) +
-        "&to=" +
-        encodeURIComponent(to.toISOString());
+        "&month=" +
+        encodeURIComponent(String(onThisDayMonth + 1)) +
+        "&day=" +
+        encodeURIComponent(String(onThisDayDate)) +
+        "&beforeYear=" +
+        encodeURIComponent(String(onThisDayYear));
 
       try {
         const res = await fetch(url, { signal: controller.signal });
+        if (res.status === 401) {
+          setOnThisDayPosts([]);
+          return;
+        }
         if (!res.ok) {
           throw new Error(`Failed to load post history (${res.status})`);
         }
-        const data = (await res.json()) as { posts?: PlannedPost[] };
-        const history = Array.isArray(data.posts) ? data.posts : [];
-        const matches = history
-          .filter((post) => post.status === "sent")
-          .filter((post) => {
-            const scheduled = new Date(post.scheduledAt);
-            if (Number.isNaN(scheduled.getTime())) {
-              return false;
-            }
-            return (
-              scheduled.getMonth() === onThisDayMonth &&
-              scheduled.getDate() === onThisDayDate &&
-              scheduled.getFullYear() < onThisDayYear
-            );
-          })
-          .sort((a, b) => b.scheduledAt.localeCompare(a.scheduledAt));
-        setOnThisDayPosts(matches);
+        const data = (await res.json()) as { posts?: OnThisDayPost[] };
+        setOnThisDayPosts(Array.isArray(data.posts) ? data.posts : []);
       } catch (err) {
         if (err instanceof Error && err.name === "AbortError") {
           return;
@@ -1036,7 +1031,7 @@ export default function App() {
             <div>
               <h3 className="text-xl font-semibold text-slate-900">On This Day</h3>
               <p className="text-sm text-slate-500">
-                Your sent posts from {todayStart.toLocaleDateString(undefined, { month: "long", day: "numeric" })} in previous years.
+                Your fediverse posts from {todayStart.toLocaleDateString(undefined, { month: "long", day: "numeric" })} in previous years.
               </p>
             </div>
           </div>
@@ -1055,7 +1050,7 @@ export default function App() {
             </div>
           ) : onThisDayPosts.length === 0 ? (
             <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
-              No sent posts found for this date in previous years.
+              No posts found for this date in previous years.
             </div>
           ) : (
             <div className="mt-4 grid gap-3">
@@ -1065,15 +1060,25 @@ export default function App() {
                   className="rounded-2xl border border-slate-200 bg-white/90 px-4 py-3 shadow-sm"
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
-                    <span className="font-semibold text-slate-700">{formatLongDate(post.scheduledAt)}</span>
+                    <span className="font-semibold text-slate-700">{formatLongDate(post.createdAt)}</span>
                     <div className="flex items-center gap-2">
-                      <span>{formatTime(post.scheduledAt)}</span>
+                      <span>{formatTime(post.createdAt)}</span>
                       <span className="rounded-full bg-slate-100 px-2 py-0.5 uppercase tracking-wide text-slate-600">
                         {post.visibility}
                       </span>
                     </div>
                   </div>
                   <p className="mt-2 text-sm text-slate-700">{post.text}</p>
+                  {post.url && (
+                    <a
+                      href={post.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-2 inline-flex text-xs font-medium text-indigo-600 hover:text-indigo-700"
+                    >
+                      View on instance
+                    </a>
+                  )}
                 </div>
               ))}
             </div>

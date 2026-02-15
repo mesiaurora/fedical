@@ -84,6 +84,94 @@ describe("GET /posts", () => {
   });
 });
 
+describe("GET /posts/on-this-day", () => {
+  it("fetches matching statuses from the fediverse account", async () => {
+    const app = Fastify();
+    const posts = new Map();
+    const tokenStore = new Map<string, { accessToken: string }>();
+    const identityStore = new Map<string, { id: string }>();
+    tokenStore.set("https://example.com", { accessToken: "token-1" });
+    identityStore.set("https://example.com", { id: "acct-1" });
+
+    let fetchCalls = 0;
+    const fakeFetch: typeof fetch = async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) {
+        return new Response(
+          JSON.stringify([
+            {
+              id: "10",
+              created_at: "2025-02-15T09:00:00.000Z",
+              content: "<p>Hello world</p>",
+              visibility: "public",
+              url: "https://example.com/@me/10",
+            },
+            {
+              id: "9",
+              created_at: "2025-03-15T09:00:00.000Z",
+              content: "<p>Not this day</p>",
+              visibility: "public",
+            },
+            {
+              id: "8",
+              created_at: "2024-02-15T15:30:00.000Z",
+              content: "<p>Hi<br />there</p>",
+              visibility: "unlisted",
+            },
+          ]),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify([]), { status: 200 });
+    };
+
+    await postsRoutes(app, { posts, tokenStore, identityStore, fetchFn: fakeFetch });
+    await app.ready();
+
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: "/posts/on-this-day?instance=https%3A%2F%2Fexample.com&month=2&day=15&beforeYear=2026",
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body) as { ok: boolean; posts: Array<{ id: string; text: string }> };
+      expect(body.ok).toBe(true);
+      expect(body.posts.map((post) => post.id)).toEqual(["10", "8"]);
+      expect(body.posts[0]?.text).toBe("Hello world");
+      expect(body.posts[1]?.text).toBe("Hi\nthere");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("returns 401 and clears auth stores when token is rejected", async () => {
+    const app = Fastify();
+    const posts = new Map();
+    const tokenStore = new Map<string, { accessToken: string }>();
+    const identityStore = new Map<string, { id: string }>();
+    tokenStore.set("https://example.com", { accessToken: "token-1" });
+    identityStore.set("https://example.com", { id: "acct-1" });
+    const fakeFetch: typeof fetch = async () => new Response("Unauthorized", { status: 401 });
+
+    await postsRoutes(app, { posts, tokenStore, identityStore, fetchFn: fakeFetch });
+    await app.ready();
+
+    try {
+      const res = await app.inject({
+        method: "GET",
+        url: "/posts/on-this-day?instance=https%3A%2F%2Fexample.com&month=2&day=15&beforeYear=2026",
+      });
+
+      expect(res.statusCode).toBe(401);
+      expect(tokenStore.has("https://example.com")).toBe(false);
+      expect(identityStore.has("https://example.com")).toBe(false);
+    } finally {
+      await app.close();
+    }
+  });
+});
+
 describe("PATCH /posts/:id", () => {
   it("updates a post and bumps updatedAt", async () => {
     const app = Fastify();

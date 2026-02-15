@@ -44,9 +44,31 @@ type PostsOptions = Partial<PostsStore> & {
   enableScheduler?: boolean;
   schedulerIntervalMs?: number;
   tokenStore?: Map<string, { accessToken: string }>;
-  identityStore?: Map<string, unknown>;
+  identityStore?: Map<string, { id: string }>;
   fetchFn?: typeof fetch;
 };
+
+type OnThisDayPost = {
+  id: string;
+  createdAt: string;
+  text: string;
+  visibility: "public" | "unlisted" | "private" | "direct";
+  url?: string;
+};
+
+const stripHtml = (html: string) =>
+  html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'")
+    .replace(/\u00a0/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
 const resolveDataFilePath = () => {
   const explicitFile = process.env.FEDICAL_DATA_FILE;
@@ -292,6 +314,63 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
     }
   );
 
+  app.get<{ Querystring: { instance?: string; month?: string; day?: string; beforeYear?: string } }>(
+    "/posts/on-this-day",
+    async (request, reply) => {
+      const { instance, month, day, beforeYear } = request.query;
+      if (!instance || !month || !day) {
+        return reply.status(400).send({ ok: false, error: "instance, month, and day are required" });
+      }
+
+      const instanceResult = validateInstanceUrl(instance);
+      if (!instanceResult.ok) {
+        return reply.status(400).send({ ok: false, error: instanceResult.error });
+      }
+
+      const monthNumber = Number.parseInt(month, 10);
+      const dayNumber = Number.parseInt(day, 10);
+      const yearLimit = Number.parseInt(beforeYear ?? String(new Date().getUTCFullYear()), 10);
+      if (
+        !Number.isInteger(monthNumber) ||
+        !Number.isInteger(dayNumber) ||
+        monthNumber < 1 ||
+        monthNumber > 12 ||
+        dayNumber < 1 ||
+        dayNumber > 31 ||
+        !Number.isInteger(yearLimit)
+      ) {
+        return reply.status(400).send({ ok: false, error: "Invalid month, day, or beforeYear" });
+      }
+
+      const token = tokenStore?.get(instanceResult.origin);
+      const identity = identityStore?.get(instanceResult.origin);
+      if (!token || !identity?.id) {
+        return reply.status(401).send({ ok: false, error: "Not logged in" });
+      }
+
+      const statusesResult = await getOnThisDayStatuses(
+        instanceResult.origin,
+        identity.id,
+        token.accessToken,
+        monthNumber,
+        dayNumber,
+        yearLimit,
+        fetchFn
+      );
+
+      if (!statusesResult.ok) {
+        if (statusesResult.error === "token_rejected") {
+          tokenStore?.delete(instanceResult.origin);
+          identityStore?.delete(instanceResult.origin);
+          return reply.status(401).send({ ok: false, error: "Not logged in" });
+        }
+        return reply.status(502).send({ ok: false, error: statusesResult.error });
+      }
+
+      return reply.status(200).send({ ok: true, posts: statusesResult.posts });
+    }
+  );
+
   app.patch<{ Params: { id: string }; Body: UpdatePostBody }>(
     "/posts/:id",
     async (request, reply) => {
@@ -391,6 +470,114 @@ export async function postsRoutes(app: FastifyInstance, options: PostsOptions = 
     return reply.status(200).send({ ok: true });
   });
 }
+
+const getOnThisDayStatuses = async (
+  origin: string,
+  accountId: string,
+  accessToken: string,
+  month: number,
+  day: number,
+  beforeYear: number,
+  fetchFn: typeof fetch = fetch
+): Promise<{ ok: true; posts: OnThisDayPost[] } | { ok: false; error: string }> => {
+  const matches: OnThisDayPost[] = [];
+  let maxId: string | undefined;
+  const maxPages = 8;
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const url = new URL(`${origin}/api/v1/accounts/${encodeURIComponent(accountId)}/statuses`);
+    url.searchParams.set("limit", "40");
+    url.searchParams.set("exclude_reblogs", "true");
+    if (maxId) {
+      url.searchParams.set("max_id", maxId);
+    }
+
+    let res: Response;
+    try {
+      res = await fetchFn(url.toString(), {
+        method: "GET",
+        headers: {
+          "accept": "application/json",
+          "authorization": `Bearer ${accessToken}`,
+        },
+      });
+    } catch {
+      return { ok: false, error: "Failed to fetch status history" };
+    }
+
+    const raw = await res.text().catch(() => "");
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: "token_rejected" };
+    }
+    if (!res.ok) {
+      return { ok: false, error: `History request failed (${res.status})` };
+    }
+
+    let data: unknown;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      return { ok: false, error: "History response was not valid JSON" };
+    }
+    if (!Array.isArray(data) || data.length === 0) {
+      break;
+    }
+
+    type ApiStatus = {
+      id?: unknown;
+      created_at?: unknown;
+      content?: unknown;
+      visibility?: unknown;
+      url?: unknown;
+      uri?: unknown;
+    };
+
+    for (const item of data as ApiStatus[]) {
+      const id = typeof item.id === "string" ? item.id : "";
+      const createdAt = typeof item.created_at === "string" ? item.created_at : "";
+      const content = typeof item.content === "string" ? item.content : "";
+      const visibility = typeof item.visibility === "string" ? item.visibility : "public";
+      const url = typeof item.url === "string" ? item.url : typeof item.uri === "string" ? item.uri : undefined;
+
+      if (!id || !createdAt) {
+        continue;
+      }
+      const created = new Date(createdAt);
+      if (Number.isNaN(created.getTime())) {
+        continue;
+      }
+      if (
+        created.getUTCFullYear() < beforeYear &&
+        created.getUTCMonth() + 1 === month &&
+        created.getUTCDate() === day
+      ) {
+        matches.push({
+          id,
+          createdAt: created.toISOString(),
+          text: stripHtml(content),
+          visibility:
+            visibility === "public" ||
+            visibility === "unlisted" ||
+            visibility === "private" ||
+            visibility === "direct"
+              ? visibility
+              : "public",
+          ...(url ? { url } : {}),
+        });
+      }
+    }
+
+    const last = data[data.length - 1] as ApiStatus;
+    const lastId = typeof last?.id === "string" ? last.id : "";
+    if (!lastId) {
+      break;
+    }
+    maxId = lastId;
+  }
+
+  matches.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return { ok: true, posts: matches };
+};
 
 export const sendStatus = async (
   origin: string,
